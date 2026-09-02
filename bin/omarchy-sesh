@@ -4503,6 +4503,10 @@ def cmd_restore(dry_run=False, name=None):
         if outcome.retryable_failure:
             return 75
         if outcome.permanent_failures:
+            # Some windows failed permanently, but the restore attempt itself
+            # is over: close the gate so periodic autosave isn't blocked for
+            # the rest of the Hyprland session.
+            mark_restore_completed(sid)
             return 1
         if not mark_restore_completed(sid):
             return 75

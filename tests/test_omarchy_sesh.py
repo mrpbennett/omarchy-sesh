@@ -4933,7 +4933,7 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertEqual(0, self.module.cmd_restore(dry_run=True))
         mark.assert_not_called()
 
-    def test_application_failure_remains_nonretryable_after_gate_is_written(self):
+    def test_application_failure_reopens_gate_but_remains_nonretryable(self):
         self.record_snapshot(
             "periodic", "complete", "", [window(1, 0, "terminal", 10)]
         )
@@ -4960,7 +4960,11 @@ class OmarchySeshTests(unittest.TestCase):
         ):
             result = self.module.cmd_restore()
         self.assertEqual(1, result)
-        mark.assert_called_once_with(1, complete=False)
+        # The gate closes before launching, then reopens once the attempt is
+        # over (even on permanent failure) so periodic autosave isn't stuck
+        # waiting for the rest of the Hyprland session.
+        mark.assert_has_calls([mock.call(1, complete=False), mock.call(1)])
+        self.assertEqual(2, mark.call_count)
 
     def test_restore_marker_write_failure_is_retryable(self):
         with (
