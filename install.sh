@@ -18,6 +18,7 @@ STATE_DIR="$STATE_HOME/omarchy"
 UNIT_DIR="$CONFIG_HOME/systemd/user"
 INSTALL_MARKER="$STATE_DIR/sesh-installed"
 MENU_CREATED_MARKER="$STATE_DIR/sesh-menu-created"
+CURRENT_SESSION="$STATE_DIR/current-session.json"
 AUTOSTART="$CONFIG_HOME/hypr/autostart.lua"
 MENU="$CONFIG_HOME/omarchy/extensions/omarchy-menu.jsonc"
 LEGACY_AUTOSTART="$HOME/.config/hypr/autostart.lua"
@@ -44,6 +45,7 @@ for state_file in \
   "$STATE_DIR/session.db-journal" \
   "$STATE_DIR/session.lock" \
   "$STATE_DIR/restore-complete.json" \
+  "$CURRENT_SESSION" \
   "$STATE_DIR/log/omarchy-sesh.log" \
   "$INSTALL_MARKER" \
   "$MENU_CREATED_MARKER"; do
@@ -53,6 +55,8 @@ for state_file in \
   fi
   [[ ! -f "$state_file" ]] || chmod 600 "$state_file"
 done
+
+[[ -f "$CURRENT_SESSION" ]] || install -m 600 /dev/null "$CURRENT_SESSION"
 
 install_was_complete=0
 autosave_was_enabled=0

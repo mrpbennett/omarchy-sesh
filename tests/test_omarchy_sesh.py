@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import importlib.machinery
 import importlib.util
 import io
@@ -23,6 +24,9 @@ AUTOSAVE_SERVICE = (
 RESTORE_SERVICE = (
     Path(__file__).parents[1] / "systemd" / "user" / "omarchy-sesh.service"
 )
+PANEL = Path(__file__).parents[1] / "Panel.qml"
+SERVICE = Path(__file__).parents[1] / "Service.qml"
+SQL_INSPECTOR = Path(__file__).parents[1] / "sql" / "omarchysesh.sql"
 
 
 def load_module(state_home):
@@ -152,10 +156,66 @@ def layout_ipc_response(workspaces, monitors, clients=None, rules=None):
     return response
 
 
+def create_released_v6_database(path):
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE sessions (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            label TEXT,
+            capture_status TEXT NOT NULL DEFAULT 'complete',
+            capture_error TEXT
+        );
+        CREATE TABLE windows (
+            id INTEGER PRIMARY KEY, session INTEGER NOT NULL, ord INTEGER NOT NULL,
+            class TEXT NOT NULL, initial_class TEXT, title TEXT, initial_title TEXT,
+            cmdline TEXT NOT NULL, cwd TEXT, workspace_id INTEGER,
+            workspace_name TEXT, monitor_name TEXT, monitor_description TEXT,
+            at_x INTEGER, at_y INTEGER, size_w INTEGER, size_h INTEGER,
+            floating INTEGER NOT NULL DEFAULT 0, fullscreen INTEGER NOT NULL DEFAULT 0,
+            pinned INTEGER NOT NULL DEFAULT 0, xwayland INTEGER NOT NULL DEFAULT 0,
+            pid INTEGER, group_id INTEGER, group_ord INTEGER,
+            FOREIGN KEY (session) REFERENCES sessions(id)
+        );
+        CREATE TABLE workspace_layouts (
+            session INTEGER NOT NULL, workspace_id INTEGER NOT NULL, layout TEXT,
+            at_x INTEGER, at_y INTEGER, size_w INTEGER, size_h INTEGER,
+            work_x INTEGER, work_y INTEGER, work_w INTEGER, work_h INTEGER,
+            gap_top INTEGER, gap_right INTEGER, gap_bottom INTEGER, gap_left INTEGER,
+            complete INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session, workspace_id),
+            FOREIGN KEY (session) REFERENCES sessions(id)
+        );
+        CREATE TABLE named_sessions (
+            name TEXT PRIMARY KEY, session INTEGER NOT NULL UNIQUE,
+            FOREIGN KEY (session) REFERENCES sessions(id)
+        );
+        INSERT INTO sessions
+            (id, created_at, label, capture_status, capture_error)
+        VALUES (41, '2026-08-31 12:34:56', 'manual', 'complete', NULL);
+        INSERT INTO windows VALUES (
+            91, 41, 0, 'terminal', 'terminal', 'Release shell', 'Release shell',
+            '/usr/bin/terminal', '/tmp/release', 3, '3', 'DP-1', 'Release Display',
+            10, 20, 800, 600, 1, 0, 1, 0, 4242, 7, 0
+        );
+        INSERT INTO workspace_layouts VALUES (
+            41, 3, 'dwindle', 0, 0, 1920, 1080, 0, 24, 1920, 1056,
+            4, 5, 6, 7, 1
+        );
+        INSERT INTO named_sessions VALUES ('release-work', 41);
+        PRAGMA user_version = 6;
+        """
+    )
+    connection.close()
+
+
 class OmarchySeshTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.module = load_module(self.tempdir.name)
+        self.history = self.module.SnapshotHistory(self.module.DB_PATH)
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -167,69 +227,71 @@ class OmarchySeshTests(unittest.TestCase):
     def assert_mode(self, path, expected):
         self.assertEqual(expected, path.stat().st_mode & 0o777, path)
 
-    def prepare_restore(self, rows, clients, query_json=None, write_log=None):
-        class InMemoryCompositor:
-            def __init__(self):
-                self.queries = []
+    def production_placement(self, row, current=None):
+        with mock.patch.object(self.module, "eval_lua", return_value=True) as evaluate:
+            result = self.module.ProductionHyprland().apply(
+                self.module.PlaceWindow(
+                    window=row, address="0x1", current=current
+                )
+            )
+        script = evaluate.call_args.args[0] if evaluate.called else None
+        return result, script
 
-            def query_json(self, endpoint, *args):
-                self.queries.append((endpoint, *args))
-                if query_json is not None:
-                    return query_json(endpoint, *args)
-                if endpoint == "clients":
-                    return clients
-                if endpoint == "getoption":
-                    return {"int": 0}
-                raise AssertionError(f"unexpected endpoint: {endpoint}")
+    def record_snapshot(
+        self,
+        label,
+        status,
+        error,
+        windows,
+        workspace_layouts=(),
+        *,
+        retention=5,
+        name=None,
+    ):
+        capture = self.module.SnapshotCapture(
+            label, status, error, windows, workspace_layouts, name
+        )
+        return self.history.record(capture, retention=retention)
 
-            def query_batch_json(self, *_commands):
-                raise AssertionError("unexpected batch query")
-
-            def dispatch(self, _lua, failure_context=None):
-                return True
-
-            def evaluate(self, _lua):
-                return True
-
-        compositor = InMemoryCompositor()
-        snapshot = self.module.Snapshot(1, rows, {})
-        prepared = self.module.RestoreRun(
-            compositor=compositor,
-            write_log=write_log or (lambda _message: None),
-        ).prepare(snapshot, self.module.RestoreSettings(20, "focused"))
-        self.assertIsNotNone(prepared)
-        return prepared, compositor
+    def execute_scenario(self, snapshot, adapter, *, messages=None):
+        clock = self.module.DeterministicClock()
+        run = self.module.RestoreRun.prepare(
+            snapshot,
+            self.module.RestoreSettings(self.module.RESTORE_TIMEOUT, "focused"),
+            compositor=adapter,
+            clock=clock,
+            write_log=(messages if messages is not None else []).append,
+        )
+        self.assertIsNotNone(run)
+        return run.execute(), clock
 
     def test_runtime_state_is_owner_only_under_a_permissive_umask(self):
         previous_umask = os.umask(0)
-        connection = None
         lock_file = None
         try:
             self.module.log("private")
             lock_file = self.module.acquire_operation_lock()
-            connection = self.module.db_conn()
+            self.history.recent()
             with mock.patch.dict(
                 os.environ,
                 {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
                 clear=False,
             ):
                 self.assertTrue(self.module.mark_restore_completed(1))
+            self.assertTrue(self.module.write_current_session_name("work"))
 
             self.assert_mode(self.module.STATE_DIR, 0o700)
             self.assert_mode(self.module.LOG_PATH.parent, 0o700)
             for path in (
                 self.module.DB_PATH,
-                Path(f"{self.module.DB_PATH}-wal"),
-                Path(f"{self.module.DB_PATH}-shm"),
                 self.module.LOCK_PATH,
                 self.module.RESTORE_MARKER_PATH,
+                self.module.CURRENT_SESSION_PATH,
                 self.module.LOG_PATH,
             ):
                 self.assertTrue(path.exists(), path)
                 self.assert_mode(path, 0o600)
         finally:
-            if connection is not None:
-                connection.close()
             if lock_file is not None:
                 lock_file.close()
             os.umask(previous_umask)
@@ -244,6 +306,7 @@ class OmarchySeshTests(unittest.TestCase):
             Path(f"{self.module.DB_PATH}-journal"),
             self.module.LOCK_PATH,
             self.module.RESTORE_MARKER_PATH,
+            self.module.CURRENT_SESSION_PATH,
             self.module.LOG_PATH,
             self.module.STATE_DIR / "sesh-installed",
             self.module.STATE_DIR / "sesh-menu-created",
@@ -414,6 +477,110 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertIn("configuration error: snapshot_retention", stderr.getvalue())
         acquire.assert_not_called()
 
+    def test_main_reports_snapshot_history_errors_without_storage_details_leaking(self):
+        stderr = io.StringIO()
+        failure = self.module.SnapshotHistoryError("snapshot history storage failed")
+        with (
+            mock.patch.object(sys, "argv", [str(SCRIPT), "status"]),
+            mock.patch.object(self.module.SnapshotHistory, "recent", side_effect=failure),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = self.module.main()
+
+        self.assertEqual(1, result)
+        self.assertIn("snapshot history error:", stderr.getvalue())
+
+    def test_main_classifies_snapshot_history_busy_as_retryable(self):
+        stderr = io.StringIO()
+        history = self.module.SnapshotHistory()
+        with (
+            mock.patch.object(sys, "argv", [str(SCRIPT), "status"]),
+            mock.patch.object(
+                self.module.sqlite3,
+                "connect",
+                side_effect=sqlite3.OperationalError("database is locked: secret.db"),
+            ),
+            mock.patch.object(self.module, "SnapshotHistory", return_value=history),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = self.module.main()
+
+        self.assertEqual(75, result)
+        self.assertNotIn("secret.db", stderr.getvalue())
+
+    def test_main_classifies_snapshot_history_permission_failure_as_permanent(self):
+        stderr = io.StringIO()
+        history = self.module.SnapshotHistory()
+        with (
+            mock.patch.object(sys, "argv", [str(SCRIPT), "status"]),
+            mock.patch.object(
+                self.module.sqlite3,
+                "connect",
+                side_effect=PermissionError(errno.EACCES, "private path"),
+            ),
+            mock.patch.object(self.module, "SnapshotHistory", return_value=history),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = self.module.main()
+
+        self.assertEqual(1, result)
+        self.assertNotIn("private path", stderr.getvalue())
+
+    def test_snapshot_history_classifies_transient_os_errors_and_corruption(self):
+        history = self.module.SnapshotHistory()
+        for message in ("database is locked", "database is busy"):
+            with self.subTest(sqlite=message):
+                with (
+                    mock.patch.object(
+                        self.module.sqlite3,
+                        "connect",
+                        side_effect=sqlite3.OperationalError(message),
+                    ),
+                    self.assertRaises(self.module.SnapshotHistoryError) as raised,
+                ):
+                    history.recent()
+                self.assertTrue(raised.exception.retryable)
+        for number in (errno.EAGAIN, errno.EBUSY, errno.EINTR):
+            with self.subTest(errno=number):
+                with (
+                    mock.patch.object(
+                        self.module.sqlite3,
+                        "connect",
+                        side_effect=OSError(number, "transient"),
+                    ),
+                    self.assertRaises(self.module.SnapshotHistoryError) as raised,
+                ):
+                    history.recent()
+                self.assertTrue(raised.exception.retryable)
+        with (
+            mock.patch.object(
+                self.module.sqlite3,
+                "connect",
+                side_effect=sqlite3.DatabaseError("database disk image is malformed"),
+            ),
+            self.assertRaises(self.module.SnapshotHistoryError) as raised,
+        ):
+            history.recent()
+        self.assertFalse(raised.exception.retryable)
+
+    def test_restore_returns_75_for_retryable_snapshot_history_failure(self):
+        lock_file = mock.Mock()
+        failure = self.module.SnapshotHistoryError(
+            "snapshot history operation failed", retryable=True
+        )
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module.SnapshotHistory, "select", side_effect=failure),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = self.module.cmd_restore()
+
+        self.assertEqual(75, result)
+        self.assertIn("snapshot history error:", stderr.getvalue())
+
     def test_restore_service_does_not_restart_configuration_errors(self):
         self.assertIn("RestartPreventExitStatus=1 2", RESTORE_SERVICE.read_text())
 
@@ -568,6 +735,293 @@ class OmarchySeshTests(unittest.TestCase):
             check=False,
         )
 
+    def test_semantic_values_are_immutable_and_mutations_are_explicit(self):
+        action = self.module.FocusWorkspace(workspace_id=3)
+        observation = self.module.ObservationResult(
+            self.module.ObservationStatus.AVAILABLE,
+            [{"address": "0xa", "workspace": {"id": 3}}],
+        )
+
+        with self.assertRaises(AttributeError):
+            action.workspace_id = 4
+        with self.assertRaises(TypeError):
+            observation.value[0]["address"] = "0xb"
+        row = window(1, 0, "terminal", 10)
+        placement = self.module.PlaceWindow(window=row, address="0xa")
+        row["class"] = "changed"
+        self.assertEqual("terminal", placement.window["class"])
+        with self.assertRaises(TypeError):
+            placement.window["class"] = "changed"
+        self.assertEqual(
+            {
+                self.module.MutationStatus.APPLIED,
+                self.module.MutationStatus.UNCHANGED,
+                self.module.MutationStatus.REJECTED,
+                self.module.MutationStatus.UNAVAILABLE,
+            },
+            set(self.module.MutationStatus),
+        )
+
+    def test_production_mutation_classifies_eval_results(self):
+        action = self.module.SetAnimations(enabled=False)
+        for raw, expected in (
+            (True, self.module.MutationStatus.APPLIED),
+            (False, self.module.MutationStatus.REJECTED),
+            (None, self.module.MutationStatus.UNAVAILABLE),
+        ):
+            with mock.patch.object(self.module, "eval_lua", return_value=raw):
+                result = self.module.ProductionHyprland().apply(action)
+            self.assertIs(expected, result.status)
+
+        row = window(1, 0, "terminal", 10)
+        unchanged = self.module.ProductionHyprland().apply(
+            self.module.PlaceWindow(
+                window=row,
+                address="0xa",
+                current=group_client(row, "0xa", []),
+            )
+        )
+        self.assertIs(self.module.MutationStatus.UNCHANGED, unchanged.status)
+
+    def test_launch_dispatch_transport_failure_is_not_reclassified_by_observation(self):
+        adapter = self.module.ProductionHyprland()
+        action = self.module.LaunchApplication(
+            command="terminal", workspace_id=1, floating=False
+        )
+        with (
+            mock.patch.object(self.module, "_dispatch_lua", return_value=None),
+            mock.patch.object(self.module, "hyprctl_json", return_value=[]) as observe,
+        ):
+            result = adapter.apply(action)
+
+        self.assertIs(self.module.MutationStatus.UNAVAILABLE, result.status)
+        observe.assert_not_called()
+
+    def test_production_monitor_move_refreshes_windows_behind_adapter_seam(self):
+        events = []
+        refreshed = [{"address": "0xa", "fullscreen": 0}]
+        adapter = self.module.ProductionHyprland()
+        with (
+            mock.patch.object(
+                self.module,
+                "dispatch",
+                side_effect=lambda _lua: events.append("dispatch") or True,
+            ),
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=lambda *_args: events.append("refresh") or refreshed,
+            ) as observe,
+        ):
+            result = adapter.apply(
+                self.module.MoveWorkspaceToDisplay(workspace_id=1, display="DP-1")
+            )
+
+        self.assertIsInstance(result, self.module.WorkspaceMoveResult)
+        self.assertIs(self.module.MutationStatus.APPLIED, result.status)
+        self.assertEqual(("dispatch", "refresh"), tuple(events))
+        observe.assert_called_once_with("clients")
+        self.assertEqual("0xa", result.refreshed_windows[0]["address"])
+        with self.assertRaises(TypeError):
+            result.refreshed_windows[0]["address"] = "changed"
+
+    def test_deterministic_unchanged_actions_do_not_mutate_or_refresh(self):
+        row = window(1, 0, "terminal", 10)
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0xa", [])],
+            workspaces=[{"id": 1, "monitor": "eDP-1"}],
+            action_results={
+                self.module.MoveWorkspaceToDisplay: [
+                    self.module.MutationStatus.UNCHANGED
+                ],
+                self.module.PlaceWindow: [self.module.MutationStatus.UNCHANGED],
+            },
+        )
+
+        move = adapter.apply(
+            self.module.MoveWorkspaceToDisplay(workspace_id=1, display="DP-1")
+        )
+        placement = adapter.apply(
+            self.module.PlaceWindow(
+                window=dict(row, workspace_id=2), address="0xa"
+            )
+        )
+
+        self.assertIsInstance(move, self.module.WorkspaceMoveResult)
+        self.assertIs(self.module.MutationStatus.UNCHANGED, move.status)
+        self.assertIsNone(move.refreshed_windows)
+        self.assertIs(self.module.MutationStatus.UNCHANGED, placement.status)
+        self.assertEqual("eDP-1", adapter.workspace_state[0]["monitor"])
+        self.assertEqual(1, adapter.windows[0]["workspace"]["id"])
+        self.assertFalse(
+            any(
+                event == ("observe", self.module.ObservationKind.WINDOWS)
+                for event in adapter.events
+            )
+        )
+
+    def test_workspace_move_result_enforces_action_specific_payload(self):
+        with self.assertRaises(ValueError):
+            self.module.WorkspaceMoveResult(self.module.MutationStatus.APPLIED)
+        with self.assertRaises(ValueError):
+            self.module.WorkspaceMoveResult(
+                self.module.MutationStatus.REJECTED, [{"address": "0xa"}]
+            )
+
+        adapter = self.module.DeterministicHyprland(
+            workspaces=[{"id": 1, "monitor": "eDP-1"}],
+            action_results={
+                self.module.MoveWorkspaceToDisplay: [
+                    self.module.MutationStatus.REJECTED
+                ]
+            },
+        )
+        result = adapter.apply(
+            self.module.MoveWorkspaceToDisplay(workspace_id=1, display="DP-1")
+        )
+        self.assertIsInstance(result, self.module.WorkspaceMoveResult)
+        self.assertIs(self.module.MutationStatus.REJECTED, result.status)
+        self.assertIsNone(result.refreshed_windows)
+        self.assertEqual("eDP-1", adapter.workspace_state[0]["monitor"])
+
+    def test_restore_run_treats_placement_transport_failure_as_retryable(self):
+        row = window(1, 0, "terminal", 10)
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0xa", [])],
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            action_results={
+                self.module.PlaceWindow: [self.module.MutationStatus.UNAVAILABLE]
+            },
+        )
+        run = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [row], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+
+        self.assertEqual(self.module.RestoreOutcome(0, 0, 0, True), run.execute())
+
+    def test_command_translates_retryable_placement_failure_to_exit_75(self):
+        row = window(1, 0, "terminal", 10)
+        self.record_snapshot("periodic", "complete", "", [row])
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0xa", [])],
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            action_results={
+                self.module.PlaceWindow: [self.module.MutationStatus.UNAVAILABLE]
+            },
+        )
+        run = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [row], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+        lock_file = mock.Mock()
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+            ),
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module.RestoreRun, "prepare", return_value=run),
+            mock.patch.object(self.module, "restore_was_completed", return_value=False),
+            mock.patch.object(self.module, "mark_restore_completed", return_value=True),
+        ):
+            result = self.module.cmd_restore()
+
+        self.assertEqual(75, result)
+
+    def test_restore_run_treats_monitor_move_transport_failure_as_retryable(self):
+        row = window(1, 0, "terminal", 10)
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0xa", [])],
+            monitors=[
+                {"id": 0, "name": "DP-1", "description": "Dell Display", "focused": True},
+                {"id": 1, "name": "eDP-1"},
+            ],
+            workspaces=[{"id": 1, "monitor": "eDP-1"}],
+            action_results={
+                self.module.MoveWindowToWorkspace: [
+                    self.module.MutationStatus.UNAVAILABLE
+                ]
+            },
+        )
+        run = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [row], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+
+        self.assertEqual(self.module.RestoreOutcome(0, 0, 0, True), run.execute())
+
+    def test_restore_run_treats_monitor_refresh_unavailability_as_retryable(self):
+        row = window(1, 0, "terminal", 10)
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0xa", [])],
+            monitors=[
+                {"id": 0, "name": "DP-1", "description": "Dell Display", "focused": True},
+                {"id": 1, "name": "eDP-1"},
+            ],
+            workspaces=[{"id": 1, "monitor": "eDP-1"}],
+            window_observations=[
+                [group_client(row, "0xa", [])],
+                self.module.ObservationResult(self.module.ObservationStatus.UNAVAILABLE),
+            ],
+        )
+        run = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [row], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+
+        self.assertEqual(self.module.RestoreOutcome(0, 0, 0, True), run.execute())
+
+    def test_unchanged_monitor_preparation_does_not_refresh_windows(self):
+        adapter = self.module.DeterministicHyprland()
+        prepared = set()
+
+        result = self.module.prepare_workspace_monitor(
+            window(1, 0, "terminal", 10),
+            "0xa",
+            {1: "DP-1"},
+            {1: "DP-1"},
+            prepared,
+            compositor=adapter,
+        )
+
+        self.assertIs(self.module.MutationStatus.UNCHANGED, result.status)
+        self.assertEqual([], adapter.events)
+
+    def test_deterministic_hyprland_queues_appearances_and_restores_scope(self):
+        adapter = self.module.DeterministicHyprland(
+            clients=[{"address": "0xa", "mapped": True}],
+            appearances=[[{"address": "0xb", "mapped": True}]],
+        )
+
+        first = adapter.observe(self.module.ObservationKind.WINDOWS)
+        second = adapter.observe(self.module.ObservationKind.WINDOWS)
+        self.assertEqual(("0xa",), tuple(w["address"] for w in first.value))
+        self.assertEqual(
+            ("0xa", "0xb"), tuple(w["address"] for w in second.value)
+        )
+        with self.assertRaises(RuntimeError):
+            with adapter.mutations():
+                self.assertFalse(adapter.animations)
+                raise RuntimeError("stop")
+        self.assertTrue(adapter.animations)
+        self.assertEqual(("mutations", "end"), adapter.events[-1])
+
     def test_migration_marks_historical_empty_session_unknown(self):
         self.module.STATE_DIR.mkdir(parents=True)
         conn = sqlite3.connect(self.module.DB_PATH)
@@ -597,7 +1051,8 @@ class OmarchySeshTests(unittest.TestCase):
         )
         conn.close()
 
-        conn = self.module.db_conn()
+        self.history.recent()
+        conn = sqlite3.connect(self.module.DB_PATH)
         status = conn.execute(
             "SELECT capture_status FROM sessions WHERE id = 1"
         ).fetchone()[0]
@@ -624,37 +1079,181 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(6, version)
         self.assertEqual(("terminal", None, None), migrated)
 
+    def test_released_v6_database_opens_without_losing_snapshot_data(self):
+        path = Path(self.tempdir.name) / "released-v6.db"
+        create_released_v6_database(path)
+
+        history = self.module.SnapshotHistory(path)
+        snapshot = history.select(name="release-work")
+
+        self.assertEqual((41, "manual", "complete"), (
+            snapshot.session_id, snapshot.label, snapshot.capture_status
+        ))
+        self.assertEqual("terminal", snapshot.windows[0].window_class)
+        self.assertEqual("Release Display", snapshot.windows[0].monitor_description)
+        self.assertEqual("dwindle", snapshot.workspace_layouts[3]["layout"])
+        self.assertEqual("release-work", history.list_named()[0].name)
+        connection = sqlite3.connect(path)
+        try:
+            self.assertEqual(6, connection.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            connection.close()
+
     def test_named_snapshot_is_retained_and_excluded_from_default_restore(self):
-        named_id = self.module.persist_snapshot(
+        named_id = self.record_snapshot(
             "manual", "complete", "", [window(1, 0, "named", 1)], name="work"
         )
         automatic_ids = [
-            self.module.persist_snapshot(
+            self.record_snapshot(
                 "periodic", "complete", "", [window(index, 0, f"app-{index}", index)]
             )
             for index in range(2, 8)
         ]
 
-        conn = self.module.db_conn()
-        self.assertEqual(
-            (named_id, "manual", mock.ANY), self.module.named_session(conn, "work")
-        )
-        self.assertEqual(automatic_ids[-1], self.module.latest_session(conn)[0])
-        retained = {row[0] for row in conn.execute("SELECT id FROM sessions")}
-        conn.close()
+        named = self.history.select(name="work")
+        self.assertEqual(named_id, named.session_id)
+        self.assertEqual("manual", named.label)
+        self.assertEqual(automatic_ids[-1], self.history.select().session_id)
+        retained = {snapshot.session_id for snapshot in self.history.recent(100)}
 
         self.assertIn(named_id, retained)
         self.assertNotIn(automatic_ids[0], retained)
         self.assertEqual(6, len(retained))
 
     def test_named_snapshot_rejects_an_existing_name(self):
-        self.module.persist_snapshot("manual", "complete", "", [], name="work")
+        self.record_snapshot("manual", "complete", "", [], name="work")
 
         with self.assertRaisesRegex(self.module.NamedSessionConflict, "work"):
-            self.module.persist_snapshot("manual", "complete", "", [], name="work")
+            self.module.SnapshotHistory(self.module.DB_PATH).record(
+                self.module.SnapshotCapture(
+                    "manual", "complete", "", [], (), "work"
+                ),
+                retention=5,
+            )
+
+        self.assertEqual(1, len(self.history.recent(100)))
+
+    def test_snapshot_history_returns_immutable_domain_values(self):
+        sid = self.record_snapshot(
+            "manual",
+            "complete",
+            "",
+            [window(41, 8, "terminal", 1), window(99, 3, "browser", 2)],
+            [workspace_layout()],
+            name="work",
+        )
+
+        snapshot = self.history.select(name="work")
+        summaries = self.history.list_named()
+
+        self.assertEqual(sid, snapshot.session_id)
+        self.assertIsInstance(snapshot.windows, tuple)
+        self.assertTrue(
+            all(
+                isinstance(item, self.module.SnapshotWindow)
+                for item in snapshot.windows
+            )
+        )
+        self.assertIsInstance(summaries, tuple)
+        self.assertEqual((0, 1), tuple(item.ord for item in snapshot.windows))
+        self.assertEqual((0, 1), tuple(item.identity for item in snapshot.windows))
+        self.assertEqual((0, 1), tuple(item["id"] for item in snapshot.windows))
+        self.assertEqual(
+            ("terminal", "browser"),
+            tuple(item.window_class for item in snapshot.windows),
+        )
+        for item in snapshot.windows:
+            self.assertNotIn("session", item)
+            self.assertNotIn("storage_id", item)
+        with self.assertRaises(TypeError):
+            snapshot.windows[0]["class"] = "changed"
+        with self.assertRaises(AttributeError):
+            snapshot.windows[0].title = "changed"
+        with self.assertRaises(TypeError):
+            snapshot.workspace_layouts[1]["layout"] = "changed"
+
+    def test_snapshot_capture_copies_and_freezes_mutable_inputs(self):
+        row = window(1, 0, "terminal", 1)
+        layout = workspace_layout()
+        windows = [row]
+        layouts = [layout]
+
+        capture = self.module.SnapshotCapture(
+            "manual", "complete", "", windows, layouts, "work"
+        )
+        row["class"] = "changed"
+        layout["layout"] = "master"
+        windows.clear()
+        layouts.clear()
+
+        self.assertEqual("terminal", capture.windows[0]["class"])
+        self.assertEqual("dwindle", capture.workspace_layouts[0]["layout"])
+        self.assertEqual(
+            ("manual", "complete", "", "work"),
+            (capture.label, capture.status, capture.error, capture.name),
+        )
+        with self.assertRaises(TypeError):
+            capture.windows[0]["class"] = "changed"
+        with self.assertRaises(AttributeError):
+            capture.label = "periodic"
+
+    def test_snapshot_history_validates_names_at_every_entry_point(self):
+        invalid_capture = self.module.SnapshotCapture(
+            "manual", "complete", "", (), (), " invalid"
+        )
+        operations = (
+            lambda: self.history.contains_named(" invalid"),
+            lambda: self.history.select(name=" invalid"),
+            lambda: self.history.delete_named(" invalid"),
+            lambda: self.history.record(invalid_capture, retention=5),
+        )
+
+        for operation in operations:
+            with self.subTest(operation=operation):
+                with self.assertRaises(ValueError):
+                    operation()
+        self.assertEqual((), self.history.recent())
+
+    def test_snapshot_history_translates_storage_failures_for_public_operations(self):
+        missing = Path(self.tempdir.name) / "missing.db"
+        history = self.module.SnapshotHistory(missing, read_only=True)
+        capture = self.module.SnapshotCapture("manual", "complete", "", (), ())
+        operations = (
+            lambda: history.contains_named("work"),
+            lambda: history.record(capture, retention=5),
+            lambda: history.select(),
+            lambda: history.list_named(),
+            lambda: history.recent(),
+            lambda: history.delete_named("work"),
+        )
+
+        for operation in operations:
+            with self.subTest(operation=operation):
+                with self.assertRaises(self.module.SnapshotHistoryError):
+                    operation()
+
+    def test_snapshot_history_failed_record_is_atomic_through_public_operations(self):
+        invalid_window = window(1, 0, "terminal", 1)
+        del invalid_window["cmdline"]
+        capture = self.module.SnapshotCapture(
+            "manual", "complete", "", [invalid_window], ()
+        )
+
+        with self.assertRaises(self.module.SnapshotHistoryError):
+            self.history.record(capture, retention=5)
+
+        self.assertEqual((), self.history.recent())
+
+    def test_named_save_conflict_is_detected_before_capture(self):
+        self.record_snapshot("manual", "complete", "", [], name="work")
+
+        with mock.patch.object(self.module, "hyprctl_json") as hyprctl:
+            self.assertEqual(1, self.module.cmd_save(name="work"))
+
+        hyprctl.assert_not_called()
 
     def test_list_prints_named_sessions(self):
-        sid = self.module.persist_snapshot(
+        sid = self.record_snapshot(
             "manual", "complete", "", [window(1, 0, "terminal", 1)], name="work"
         )
         stdout = io.StringIO()
@@ -665,7 +1264,7 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertIn("1 windows", stdout.getvalue())
 
     def test_list_json_prints_named_session_metadata(self):
-        sid = self.module.persist_snapshot(
+        sid = self.record_snapshot(
             "manual", "complete", "", [window(1, 0, "terminal", 1)], name='work "desk"'
         )
         stdout = io.StringIO()
@@ -692,7 +1291,7 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual([], self.module.json.loads(stdout.getvalue()))
 
     def test_delete_removes_named_snapshot_and_its_payload(self):
-        sid = self.module.persist_snapshot(
+        sid = self.record_snapshot(
             "manual",
             "complete",
             "",
@@ -702,20 +1301,47 @@ class OmarchySeshTests(unittest.TestCase):
         )
 
         self.assertEqual(0, self.module.cmd_delete("work"))
-        conn = self.module.db_conn()
-        self.assertIsNone(self.module.named_session(conn, "work"))
-        self.assertIsNone(
-            conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone()
+        self.assertIsNone(self.history.select(name="work"))
+        self.assertIsNone(self.history.select(session_id=sid))
+
+    def test_delete_clears_current_session_marker_when_it_matches(self):
+        self.record_snapshot(
+            "manual",
+            "complete",
+            "",
+            [window(1, 0, "terminal", 1)],
+            [workspace_layout()],
+            name="work",
         )
-        self.assertIsNone(
-            conn.execute("SELECT 1 FROM windows WHERE session = ?", (sid,)).fetchone()
+        self.module.write_current_session_name("work")
+
+        self.assertEqual(0, self.module.cmd_delete("work"))
+        self.assertIsNone(self.module.read_current_session_name())
+
+    def test_delete_leaves_unrelated_current_session_marker_untouched(self):
+        self.record_snapshot(
+            "manual",
+            "complete",
+            "",
+            [window(1, 0, "terminal", 1)],
+            [workspace_layout()],
+            name="work",
         )
-        self.assertIsNone(
-            conn.execute(
-                "SELECT 1 FROM workspace_layouts WHERE session = ?", (sid,)
-            ).fetchone()
-        )
-        conn.close()
+        self.module.write_current_session_name("other")
+
+        self.assertEqual(0, self.module.cmd_delete("work"))
+        self.assertEqual("other", self.module.read_current_session_name())
+
+    def test_delete_succeeds_when_current_session_metadata_cannot_be_written(self):
+        self.record_snapshot("manual", "complete", "", [], name="work")
+        with (
+            mock.patch.object(self.module, "read_current_session_name", return_value="work"),
+            mock.patch.object(
+                self.module, "write_current_session_name", return_value=False
+            ) as write_marker,
+        ):
+            self.assertEqual(0, self.module.cmd_delete("work"))
+        write_marker.assert_called_once_with(None)
 
     def test_delete_rejects_a_missing_named_session(self):
         stderr = io.StringIO()
@@ -724,14 +1350,12 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertIn("no saved session named 'missing'", stderr.getvalue())
 
     def test_restore_selects_the_requested_named_snapshot(self):
-        sid = self.module.persist_snapshot(
+        sid = self.record_snapshot(
             "manual", "complete", "", [window(1, 0, "terminal", 1)], name="work"
         )
         lock_file = mock.Mock()
-        observation = mock.Mock()
         prepared = mock.Mock()
         prepared.execute.return_value = self.module.RestoreOutcome(1, 0, 1, False)
-        observation.prepare.return_value = prepared
         with (
             mock.patch.dict(
                 os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
@@ -740,24 +1364,43 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module, "acquire_operation_lock", return_value=lock_file
             ),
             mock.patch.object(
-                self.module.RestoreRun, "observe", return_value=observation
-            ),
+                self.module.RestoreRun, "prepare", return_value=prepared
+            ) as prepare,
             mock.patch.object(self.module, "restore_was_completed", return_value=False),
             mock.patch.object(self.module, "mark_restore_completed", return_value=True),
         ):
             self.assertEqual(0, self.module.cmd_restore(name="work"))
 
-        self.assertEqual(sid, observation.prepare.call_args.args[0].session_id)
+        self.assertEqual(sid, prepare.call_args.args[0].session_id)
+        self.assertEqual("work", self.module.read_current_session_name())
 
-    def test_named_restore_can_repeat_in_the_same_desktop(self):
-        self.module.persist_snapshot(
+    def test_restore_succeeds_when_current_session_metadata_cannot_be_written(self):
+        self.record_snapshot(
             "manual", "complete", "", [window(1, 0, "terminal", 1)], name="work"
         )
+        prepared = mock.Mock()
+        prepared.execute.return_value = self.module.RestoreOutcome(1, 0, 0, False)
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+            ),
+            mock.patch.object(self.module.RestoreRun, "prepare", return_value=prepared),
+            mock.patch.object(self.module, "mark_restore_completed", return_value=True),
+            mock.patch.object(
+                self.module, "write_current_session_name", return_value=False
+            ) as write_marker,
+        ):
+            self.assertEqual(0, self.module.cmd_restore(name="work"))
+        write_marker.assert_called_once_with("work")
+
+    def test_default_restore_clears_the_current_session_name(self):
+        self.module.write_current_session_name("work")
+        self.record_snapshot(
+            "periodic", "complete", "", [window(1, 0, "terminal", 1)]
+        )
         lock_file = mock.Mock()
-        observation = mock.Mock()
         prepared = mock.Mock()
         prepared.execute.return_value = self.module.RestoreOutcome(1, 0, 1, False)
-        observation.prepare.return_value = prepared
         with (
             mock.patch.dict(
                 os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
@@ -766,7 +1409,31 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module, "acquire_operation_lock", return_value=lock_file
             ),
             mock.patch.object(
-                self.module.RestoreRun, "observe", return_value=observation
+                self.module.RestoreRun, "prepare", return_value=prepared
+            ),
+            mock.patch.object(self.module, "restore_was_completed", return_value=False),
+            mock.patch.object(self.module, "mark_restore_completed", return_value=True),
+        ):
+            self.assertEqual(0, self.module.cmd_restore())
+
+        self.assertIsNone(self.module.read_current_session_name())
+
+    def test_named_restore_can_repeat_in_the_same_desktop(self):
+        self.record_snapshot(
+            "manual", "complete", "", [window(1, 0, "terminal", 1)], name="work"
+        )
+        lock_file = mock.Mock()
+        prepared = mock.Mock()
+        prepared.execute.return_value = self.module.RestoreOutcome(1, 0, 1, False)
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+            ),
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(
+                self.module.RestoreRun, "prepare", return_value=prepared
             ),
             mock.patch.object(
                 self.module, "restore_was_completed", return_value=True
@@ -788,6 +1455,7 @@ class OmarchySeshTests(unittest.TestCase):
         legacy = Path(self.tempdir.name) / "legacy" / "omarchy"
         legacy.mkdir(parents=True)
         (legacy / "session.db").write_text("database")
+        (legacy / "current-session.json").write_text('{"name": "work"}')
         (legacy / "sesh").mkdir()
         (legacy / "sesh" / "config.json").write_text("{}")
         with (
@@ -815,6 +1483,11 @@ class OmarchySeshTests(unittest.TestCase):
         self.assert_mode(
             Path(self.tempdir.name) / "state" / "omarchy" / "session.db", 0o600
         )
+        current_session = (
+            Path(self.tempdir.name) / "state" / "omarchy" / "current-session.json"
+        )
+        self.assertEqual('{"name": "work"}', current_session.read_text())
+        self.assert_mode(current_session, 0o600)
         self.assertTrue(
             (
                 Path(self.tempdir.name) / "config" / "omarchy" / "sesh" / "config.json"
@@ -823,55 +1496,46 @@ class OmarchySeshTests(unittest.TestCase):
 
     def test_complete_empty_snapshot_supersedes_older_nonempty_snapshot(self):
         row = window(1, 0, "terminal", 10)
-        self.module.persist_snapshot("periodic", "complete", "", [row])
-        empty_id = self.module.persist_snapshot("manual", "complete", "", [])
+        self.record_snapshot("periodic", "complete", "", [row])
+        empty_id = self.record_snapshot("manual", "complete", "", [])
 
-        conn = self.module.db_conn()
-        session = self.module.latest_session(conn)
-        rows = self.module.load_windows(conn, session[0])
-        conn.close()
+        snapshot = self.history.select()
 
-        self.assertEqual(empty_id, session[0])
-        self.assertEqual([], rows)
+        self.assertEqual(empty_id, snapshot.session_id)
+        self.assertEqual((), snapshot.windows)
 
     def test_failed_teardown_does_not_supersede_complete_snapshot(self):
-        complete_id = self.module.persist_snapshot(
+        complete_id = self.record_snapshot(
             "periodic", "complete", "", [window(1, 0, "terminal", 10)]
         )
-        self.module.persist_snapshot(
+        self.record_snapshot(
             "logout", "failed", "teardown captures are diagnostic only", []
         )
 
-        conn = self.module.db_conn()
-        session = self.module.latest_session(conn)
-        conn.close()
-
-        self.assertEqual(complete_id, session[0])
+        self.assertEqual(complete_id, self.history.select().session_id)
 
     def test_group_metadata_persists_round_trip(self):
         row = window(1, 0, "terminal", 10)
         row.update(group_id=1, group_ord=0)
-        sid = self.module.persist_snapshot("periodic", "complete", "", [row])
-        conn = self.module.db_conn()
-        loaded = self.module.load_windows(conn, sid)
-        conn.close()
-        self.assertEqual((1, 0), (loaded[0]["group_id"], loaded[0]["group_ord"]))
+        sid = self.record_snapshot("periodic", "complete", "", [row])
+        loaded = self.history.select(session_id=sid)
+        self.assertEqual(
+            (1, 0), (loaded.windows[0]["group_id"], loaded.windows[0]["group_ord"])
+        )
 
     def test_workspace_layout_metadata_persists_round_trip(self):
         layout = workspace_layout()
-        sid = self.module.persist_snapshot(
+        sid = self.record_snapshot(
             "periodic", "complete", "", [window(1, 0, "terminal", 10)], [layout]
         )
-        conn = self.module.db_conn()
-        loaded = self.module.load_workspace_layouts(conn, sid)
-        conn.close()
-        self.assertEqual(layout, loaded[1])
+        loaded = self.history.select(session_id=sid)
+        self.assertEqual(layout, loaded.workspace_layouts[1])
 
     def test_pruning_removes_workspace_layout_metadata(self):
         session_ids = []
         for index in range(6):
             session_ids.append(
-                self.module.persist_snapshot(
+                self.record_snapshot(
                     "periodic",
                     "complete",
                     "",
@@ -879,29 +1543,21 @@ class OmarchySeshTests(unittest.TestCase):
                     [workspace_layout()],
                 )
             )
-        conn = self.module.db_conn()
-        retained = {
-            row[0] for row in conn.execute("SELECT session FROM workspace_layouts")
-        }
-        conn.close()
+        retained = {snapshot.session_id for snapshot in self.history.recent(100)}
         self.assertNotIn(session_ids[0], retained)
         self.assertEqual(set(session_ids[1:]), retained)
 
     def test_snapshot_retention_applies_to_complete_and_diagnostic_history(self):
         for index in range(3):
-            self.module.persist_snapshot(
-                "periodic", "complete", "", [], snapshot_retention=2
+            self.record_snapshot(
+                "periodic", "complete", "", [], retention=2
             )
-            self.module.persist_snapshot(
-                "logout", "failed", f"failure {index}", [], snapshot_retention=2
+            self.record_snapshot(
+                "logout", "failed", f"failure {index}", [], retention=2
             )
-        conn = self.module.db_conn()
-        counts = dict(
-            conn.execute(
-                "SELECT capture_status, COUNT(*) FROM sessions GROUP BY capture_status"
-            )
-        )
-        conn.close()
+        counts = {}
+        for snapshot in self.history.recent(100):
+            counts[snapshot.capture_status] = counts.get(snapshot.capture_status, 0) + 1
 
         self.assertEqual({"complete": 2, "failed": 2}, counts)
 
@@ -928,9 +1584,42 @@ class OmarchySeshTests(unittest.TestCase):
             )
 
         self.assertIn("Session saved under test", stdout.getvalue())
-        conn = self.module.db_conn()
-        self.assertIsNotNone(self.module.named_session(conn, "test"))
-        conn.close()
+        self.assertIsNotNone(self.history.select(name="test"))
+        self.assertEqual("test", self.module.read_current_session_name())
+
+    def test_save_succeeds_when_current_session_metadata_cannot_be_written(self):
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+            ),
+            mock.patch.object(self.module, "mark_restore_completed", return_value=True),
+            mock.patch.object(
+                self.module, "write_current_session_name", return_value=False
+            ) as write_marker,
+        ):
+            self.assertEqual(
+                0,
+                self.module._save_clients(
+                    "manual", [], [], "complete", [], name="work"
+                ),
+            )
+        write_marker.assert_called_once_with("work")
+
+    def test_manual_save_clears_the_current_session_name(self):
+        self.module.write_current_session_name("work")
+        with mock.patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}):
+            self.assertEqual(
+                0, self.module._save_clients("manual", [], [], "complete", [])
+            )
+        self.assertIsNone(self.module.read_current_session_name())
+
+    def test_periodic_save_does_not_touch_the_current_session_name(self):
+        self.module.write_current_session_name("work")
+        with mock.patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}):
+            self.assertEqual(
+                0, self.module._save_clients("periodic", [], [], "complete", [])
+            )
+        self.assertEqual("work", self.module.read_current_session_name())
 
     def test_save_reports_hyprland_ipc_failure(self):
         stderr = io.StringIO()
@@ -938,7 +1627,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "hyprctl_json", return_value=None),
             contextlib.redirect_stderr(stderr),
         ):
-            self.assertEqual(1, self.module.cmd_save(name="test"))
+            self.assertEqual(75, self.module.cmd_save(name="test"))
         self.assertIn("save failed: Hyprland IPC is unavailable", stderr.getvalue())
 
     def test_logout_save_closes_autosave_gate_before_capture(self):
@@ -1009,7 +1698,7 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module, "read_proc", return_value=("/usr/bin/terminal", "/tmp", "")
             ),
             mock.patch.object(
-                self.module, "persist_snapshot", return_value=7
+                self.module.SnapshotHistory, "record", return_value=7
             ) as persist,
             mock.patch.object(self.module, "log"),
         ):
@@ -1040,7 +1729,9 @@ class OmarchySeshTests(unittest.TestCase):
                 ),
             )
 
-        saved = persist.call_args.args[3][0]
+        capture = persist.call_args.args[0]
+        saved = capture.windows[0]
+        self.assertEqual({"retention": 5}, persist.call_args.kwargs)
         self.assertEqual(
             (12, 34, 800, 600),
             (saved["at_x"], saved["at_y"], saved["size_w"], saved["size_h"]),
@@ -1072,7 +1763,7 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module, "read_proc", return_value=("/usr/bin/example", "/tmp", "")
             ),
             mock.patch.object(
-                self.module, "persist_snapshot", return_value=7
+                self.module.SnapshotHistory, "record", return_value=7
             ) as persist,
             mock.patch.object(self.module, "log"),
         ):
@@ -1095,7 +1786,8 @@ class OmarchySeshTests(unittest.TestCase):
                 ),
             )
 
-        self.assertEqual([workspace_layout()], persist.call_args.args[4])
+        capture = persist.call_args.args[0]
+        self.assertEqual(workspace_layout(), capture.workspace_layouts[0])
 
     def test_workspace_layout_is_incomplete_when_tiled_client_is_not_captured(self):
         clients = [
@@ -1160,7 +1852,7 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module, "read_proc", return_value=("/usr/bin/terminal", "/tmp", "")
             ),
             mock.patch.object(
-                self.module, "persist_snapshot", return_value=7
+                self.module.SnapshotHistory, "record", return_value=7
             ) as persist,
             mock.patch.object(self.module, "log"),
         ):
@@ -1175,7 +1867,7 @@ class OmarchySeshTests(unittest.TestCase):
                 ),
             )
 
-        saved = persist.call_args.args[3]
+        saved = persist.call_args.args[0].windows
         self.assertEqual(
             [(1, 1), (1, 0)], [(r["group_id"], r["group_ord"]) for r in saved]
         )
@@ -1314,7 +2006,10 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "eval_lua", return_value=True) as evaluate,
             mock.patch.object(self.module, "dispatch") as dispatch,
         ):
-            self.assertTrue(self.module.place_window(row, "0x1"))
+            self.assertIs(
+                self.module.MutationStatus.APPLIED,
+                self.module.place_window(row, "0x1").status,
+            )
 
         dispatch.assert_not_called()
         evaluate.assert_called_once()
@@ -1329,7 +2024,10 @@ class OmarchySeshTests(unittest.TestCase):
     def test_placement_reports_failure_without_aborting_remaining_dispatches(self):
         row = window(1, 0, "terminal", 10)
         with mock.patch.object(self.module, "eval_lua", return_value=False) as evaluate:
-            self.assertFalse(self.module.place_window(row, "0x1"))
+            self.assertIs(
+                self.module.MutationStatus.REJECTED,
+                self.module.place_window(row, "0x1").status,
+            )
 
         script = evaluate.call_args.args[0]
         # Every dispatch is counted rather than raising at the first failure,
@@ -1340,7 +2038,10 @@ class OmarchySeshTests(unittest.TestCase):
     def test_placement_ipc_failure_is_reported_as_failure(self):
         row = window(1, 0, "terminal", 10)
         with mock.patch.object(self.module, "eval_lua", return_value=None):
-            self.assertFalse(self.module.place_window(row, "0x1"))
+            self.assertIs(
+                self.module.MutationStatus.UNAVAILABLE,
+                self.module.place_window(row, "0x1").status,
+            )
 
     def test_already_correct_window_costs_no_compositor_round_trip(self):
         row = window(1, 0, "terminal", 10)
@@ -1355,7 +2056,10 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "eval_lua") as evaluate,
             mock.patch.object(self.module, "dispatch") as dispatch,
         ):
-            self.assertTrue(self.module.place_window(row, "0x1", current))
+            self.assertIs(
+                self.module.MutationStatus.UNCHANGED,
+                self.module.place_window(row, "0x1", current).status,
+            )
 
         evaluate.assert_not_called()
         dispatch.assert_not_called()
@@ -1370,21 +2074,15 @@ class OmarchySeshTests(unittest.TestCase):
             "fullscreenClient": 2,
             "pinned": False,
         }
-        operations = self.module.window_placement_operations(row, "0x1", current)
+        result, script = self.production_placement(row, current)
         self.assertEqual(
-            [
-                (
-                    "hl.dsp.window.fullscreen_state({ internal = 0, client = 0, "
-                    "window = [[address:0x1]] })"
-                ),
-                'hl.dsp.window.float({ action = "on", window = [[address:0x1]] })',
-                (
-                    "hl.dsp.window.fullscreen_state({ internal = 2, client = 2, "
-                    "window = [[address:0x1]] })"
-                ),
-            ],
-            operations,
+            self.module.MutationResult(self.module.MutationStatus.APPLIED), result
         )
+        cleared = "hl.dsp.window.fullscreen_state({ internal = 0, client = 0"
+        floated = 'hl.dsp.window.float({ action = "on"'
+        restored = "hl.dsp.window.fullscreen_state({ internal = 2, client = 2"
+        self.assertLess(script.index(cleared), script.index(floated))
+        self.assertLess(script.index(floated), script.index(restored))
 
     def test_pin_is_temporarily_cleared_before_floating_geometry(self):
         row = window(1, 0, "terminal", 10)
@@ -1399,20 +2097,17 @@ class OmarchySeshTests(unittest.TestCase):
             "pinned": True,
         }
 
-        operations = self.module.window_placement_operations(row, "0x1", current)
+        result, script = self.production_placement(row, current)
 
-        self.assertEqual(2, sum("window.pin" in operation for operation in operations))
-        self.assertLess(
-            operations.index("hl.dsp.window.pin({ window = [[address:0x1]] })"),
-            next(
-                i
-                for i, operation in enumerate(operations)
-                if "window.resize" in operation
-            ),
-        )
         self.assertEqual(
-            "hl.dsp.window.pin({ window = [[address:0x1]] })", operations[-1]
+            self.module.MutationResult(self.module.MutationStatus.APPLIED), result
         )
+        self.assertEqual(2, script.count("hl.dsp.window.pin"))
+        first_pin = script.index("hl.dsp.window.pin")
+        resize = script.index("hl.dsp.window.resize")
+        last_pin = script.rindex("hl.dsp.window.pin")
+        self.assertLess(first_pin, resize)
+        self.assertLess(resize, last_pin)
 
     def test_matching_floating_geometry_is_not_redispatched(self):
         row = window(1, 0, "terminal", 10)
@@ -1427,9 +2122,11 @@ class OmarchySeshTests(unittest.TestCase):
             "pinned": False,
         }
 
+        result, script = self.production_placement(row, current)
         self.assertEqual(
-            [], self.module.window_placement_operations(row, "0x1", current)
+            self.module.MutationResult(self.module.MutationStatus.UNCHANGED), result
         )
+        self.assertIsNone(script)
 
     def test_divergent_client_fullscreen_state_is_still_corrected(self):
         row = window(1, 0, "terminal", 10)
@@ -1440,36 +2137,28 @@ class OmarchySeshTests(unittest.TestCase):
             "fullscreenClient": 1,
             "pinned": False,
         }
-        operations = self.module.window_placement_operations(row, "0x1", current)
+        result, script = self.production_placement(row, current)
         self.assertEqual(
-            [
-                (
-                    "hl.dsp.window.fullscreen_state({ internal = 0, client = 0, "
-                    "window = [[address:0x1]] })"
-                )
-            ],
-            operations,
+            self.module.MutationResult(self.module.MutationStatus.APPLIED), result
         )
+        self.assertEqual(1, script.count("hl.dsp.window.fullscreen_state"))
+        self.assertIn("internal = 0, client = 0", script)
 
     def test_unknown_client_state_still_dispatches_every_property(self):
         row = window(1, 0, "terminal", 10)
         row.update(pinned=1)
-        operations = self.module.window_placement_operations(row, "0x1")
+        result, script = self.production_placement(row)
         self.assertEqual(
-            [
-                (
-                    "hl.dsp.window.fullscreen_state({ internal = 0, client = 0, "
-                    "window = [[address:0x1]] })"
-                ),
-                (
-                    "hl.dsp.window.move({ workspace = 1, follow = false, "
-                    "window = [[address:0x1]] })"
-                ),
-                'hl.dsp.window.float({ action = "off", window = [[address:0x1]] })',
-                "hl.dsp.window.pin({ window = [[address:0x1]] })",
-            ],
-            operations,
+            self.module.MutationResult(self.module.MutationStatus.APPLIED), result
         )
+        operations = (
+            "hl.dsp.window.fullscreen_state",
+            "hl.dsp.window.move",
+            "hl.dsp.window.float",
+            "hl.dsp.window.pin",
+        )
+        positions = [script.index(operation) for operation in operations]
+        self.assertEqual(sorted(positions), positions)
 
     def test_floating_verification_reapplies_mismatched_geometry(self):
         row = window(1, 0, "terminal", 10)
@@ -1485,14 +2174,22 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(
                 self.module, "hyprctl_json", side_effect=[[wrong], [correct]]
             ),
-            mock.patch.object(self.module, "place_window", return_value=True) as place,
+            mock.patch.object(
+                self.module,
+                "place_window",
+                return_value=self.module.MutationResult(
+                    self.module.MutationStatus.APPLIED
+                ),
+            ) as place,
             mock.patch.object(self.module.time, "sleep"),
         ):
             result = self.module.verify_floating_placements([row], {1: "0x1"})
 
         self.assertTrue(result)
         place.assert_called_once()
-        self.assertEqual((row, "0x1", wrong), place.call_args.args)
+        self.assertEqual((row, "0x1"), place.call_args.args[:2])
+        self.assertEqual([0, 0], list(place.call_args.args[2]["at"]))
+        self.assertEqual([400, 300], list(place.call_args.args[2]["size"]))
 
     def test_floating_verification_ipc_failure_is_retryable(self):
         row = window(1, 0, "terminal", 10)
@@ -1515,7 +2212,13 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(
                 self.module, "hyprctl_json", side_effect=[[wrong], [wrong]]
             ),
-            mock.patch.object(self.module, "place_window", return_value=True),
+            mock.patch.object(
+                self.module,
+                "place_window",
+                return_value=self.module.MutationResult(
+                    self.module.MutationStatus.APPLIED
+                ),
+            ),
             mock.patch.object(self.module.time, "sleep"),
             mock.patch.object(self.module, "log") as log,
         ):
@@ -1528,22 +2231,27 @@ class OmarchySeshTests(unittest.TestCase):
 
     def test_placement_without_an_address_fails(self):
         with mock.patch.object(self.module, "eval_lua") as evaluate:
-            self.assertFalse(self.module.place_window(window(1, 0, "terminal", 10), ""))
+            self.assertIs(
+                self.module.MutationStatus.REJECTED,
+                self.module.place_window(window(1, 0, "terminal", 10), "").status,
+            )
         evaluate.assert_not_called()
 
     def test_prepare_moves_each_workspace_once_before_window_state(self):
         rows = [window(1, 0, "terminal", 10), window(2, 1, "browser", 20)]
         prepared = set()
-        with mock.patch.object(self.module, "dispatch", return_value=True) as dispatch:
-            self.assertTrue(
+        with mock.patch.object(self.module, "_dispatch_lua", return_value=True) as dispatch:
+            self.assertIs(
+                self.module.MutationStatus.APPLIED,
                 self.module.prepare_workspace_monitor(
                     rows[0], "0x1", {1: "DP-1"}, {1: "eDP-1"}, prepared
-                )
+                ).status,
             )
-            self.assertTrue(
+            self.assertIs(
+                self.module.MutationStatus.UNCHANGED,
                 self.module.prepare_workspace_monitor(
                     rows[1], "0x2", {1: "DP-1"}, {1: "eDP-1"}, prepared
-                )
+                ).status,
             )
 
         self.assertEqual(
@@ -1558,11 +2266,12 @@ class OmarchySeshTests(unittest.TestCase):
     def test_prepare_skips_workspace_already_on_saved_monitor(self):
         row = window(1, 0, "terminal", 10)
         prepared = set()
-        with mock.patch.object(self.module, "dispatch") as dispatch:
-            self.assertTrue(
+        with mock.patch.object(self.module, "_dispatch_lua") as dispatch:
+            self.assertIs(
+                self.module.MutationStatus.UNCHANGED,
                 self.module.prepare_workspace_monitor(
                     row, "0x1", {1: "DP-1"}, {1: "DP-1"}, prepared
-                )
+                ).status,
             )
 
         dispatch.assert_not_called()
@@ -1574,40 +2283,50 @@ class OmarchySeshTests(unittest.TestCase):
         stale = group_client(row, "0x1", [])
         stale["fullscreen"] = 2
         refreshed = dict(stale, fullscreen=0)
-        responses = iter(([stale], [refreshed]))
-
-        def query_json(endpoint, *_args):
-            if endpoint == "clients":
-                return next(responses)
-            if endpoint == "getoption":
-                return {"int": 0}
-            raise AssertionError(endpoint)
-
-        with (
-            mock.patch.object(
-                self.module,
-                "load_workspace_monitor_context",
-                return_value=({1: "DP-1"}, {1: "eDP-1"}, False),
-            ),
-            mock.patch.object(
-                self.module, "prepare_workspace_monitor", return_value=True
-            ),
-            mock.patch.object(self.module, "place_window", return_value=True) as place,
-            mock.patch.object(
-                self.module, "verify_floating_placements", return_value=True
-            ),
-            mock.patch.object(self.module, "restore_window_groups", return_value=True),
-            mock.patch.object(self.module, "load_focus_context", return_value={}),
-            mock.patch.object(self.module, "restore_focus_context", return_value=True),
-        ):
-            prepared, compositor = self.prepare_restore(
-                [row], [stale], query_json=query_json
-            )
-            outcome = prepared.execute()
+        compositor = self.module.DeterministicHyprland(
+            clients=[stale],
+            monitors=[
+                {"id": 0, "name": "DP-1", "description": "Dell Display", "focused": True},
+                {"id": 1, "name": "eDP-1", "description": "Internal"},
+            ],
+            workspaces=[{"id": 1, "monitor": "eDP-1"}],
+            window_observations=[[stale], [refreshed]],
+        )
+        prepared = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [row], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=compositor,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+        outcome = prepared.execute()
 
         self.assertEqual(self.module.RestoreOutcome(1, 0, 0, False), outcome)
-        self.assertEqual(2, compositor.queries.count(("clients",)))
-        self.assertEqual((row, "0x1", refreshed), place.call_args.args)
+        self.assertEqual(
+            2,
+            compositor.events.count(
+                ("observe", self.module.ObservationKind.WINDOWS)
+            ),
+        )
+        placement = next(
+            event[1]
+            for event in compositor.events
+            if event[0] == "action" and isinstance(event[1], self.module.PlaceWindow)
+        )
+        move_index = next(
+            index
+            for index, event in enumerate(compositor.events)
+            if event[0] == "action"
+            and isinstance(event[1], self.module.MoveWorkspaceToDisplay)
+        )
+        refresh_index = compositor.events.index(
+            ("observe", self.module.ObservationKind.WINDOWS), move_index
+        )
+        place_index = compositor.events.index(("action", placement))
+        self.assertLess(move_index, refresh_index)
+        self.assertLess(refresh_index, place_index)
+        self.assertEqual("0x1", placement.address)
+        self.assertEqual(0, placement.current["fullscreen"])
 
     def test_monitor_move_failure_does_not_block_later_workspace(self):
         first = window(1, 0, "terminal", 10)
@@ -1621,84 +2340,153 @@ class OmarchySeshTests(unittest.TestCase):
         current = {1: "eDP-1", 2: "eDP-1"}
         prepared = set()
         with mock.patch.object(
-            self.module, "dispatch", side_effect=[True, False, True, True]
+            self.module, "_dispatch_lua", side_effect=[True, False, True, True]
         ) as dispatch:
-            self.assertFalse(
+            self.assertIs(
+                self.module.MutationStatus.REJECTED,
                 self.module.prepare_workspace_monitor(
                     first, "0x1", targets, current, prepared
-                )
+                ).status,
             )
-            self.assertTrue(
+            self.assertIs(
+                self.module.MutationStatus.APPLIED,
                 self.module.prepare_workspace_monitor(
                     second, "0x2", targets, current, prepared
-                )
+                ).status,
             )
 
         self.assertEqual(4, dispatch.call_count)
         self.assertEqual({2}, prepared)
 
     def test_restore_run_exposes_named_outcome_through_in_memory_adapter(self):
-        class InMemoryRestoreAdapter:
-            def __init__(self):
-                self.calls = []
-
-            def query_json(self, endpoint, *_args):
-                self.calls.append(endpoint)
-                if endpoint == "clients":
-                    return [client]
-                if endpoint == "getoption":
-                    return {"int": 0}
-                raise AssertionError(endpoint)
-
-            def query_batch_json(self, *_commands):
-                raise AssertionError("unexpected batch query")
-
-            def dispatch(self, lua, failure_context=None):
-                self.calls.append((lua, failure_context))
-                return True
-
-            def evaluate(self, lua):
-                self.calls.append(lua)
-                return True
-
-        adapter = InMemoryRestoreAdapter()
         row = window(1, 0, "terminal", 10)
         client = group_client(row, "0xa", [])
+        adapter = self.module.DeterministicHyprland(
+            clients=[client],
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+        )
         snapshot = self.module.Snapshot(1, [row], {})
-        with (
-            mock.patch.object(
-                self.module,
-                "load_workspace_monitor_context",
-                return_value=({}, {}, False),
-            ),
-            mock.patch.object(self.module, "place_window", return_value=True),
-            mock.patch.object(self.module, "load_focus_context", return_value={}),
-            mock.patch.object(self.module, "restore_window_groups", return_value=True),
-        ):
-            prepared = self.module.RestoreRun(
-                compositor=adapter, write_log=lambda _message: None
-            ).prepare(snapshot, self.module.RestoreSettings(20, "focused"))
-            outcome = prepared.execute()
+        prepared = self.module.RestoreRun.prepare(
+            snapshot,
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+        outcome = prepared.execute()
 
         self.assertEqual(
             self.module.RestoreOutcome(1, 0, 0, False),
             outcome,
         )
-        self.assertEqual("clients", adapter.calls[0])
-        self.assertIn("getoption", adapter.calls)
+        self.assertEqual(
+            ("observe", self.module.ObservationKind.WINDOWS), adapter.events[0]
+        )
+        self.assertIn(("mutations", "begin"), adapter.events)
+        with self.assertRaisesRegex(RuntimeError, "execute only once"):
+            prepared.execute()
+
+    def test_restore_preview_is_immutable_repeatable_and_effect_free(self):
+        row = window(1, 0, "terminal", 10)
+        adapter = self.module.DeterministicHyprland()
+        run = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [row], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+
+        preview = run.preview()
+
+        self.assertIsInstance(preview, self.module.RestorePreview)
+        self.assertEqual(preview, run.preview())
+        self.assertEqual(1, preview.maximum_processes)
+        self.assertEqual(
+            self.module.RestorePreviewEntry(
+                "terminal",
+                "cd -- /tmp && /usr/bin/example",
+                "workspace = [[1 silent]]",
+                1,
+            ),
+            preview.entries[0],
+        )
+        self.assertEqual(
+            [("observe", self.module.ObservationKind.WINDOWS)], adapter.events
+        )
+        with self.assertRaises(AttributeError):
+            preview.maximum_processes = 2
+
+    def test_restore_run_freezes_planning_inputs_before_public_execution(self):
+        row = window(1, 0, "terminal", 10)
+        client = group_client(row, "0xa", [])
+        snapshot = self.module.Snapshot(1, [row], {})
+        adapter = self.module.DeterministicHyprland(
+            clients=[client],
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+        )
+        run = self.module.RestoreRun.prepare(
+            snapshot,
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+
+        row["class"] = "changed"
+        client["address"] = "changed"
+
+        self.assertEqual((), run.preview().entries)
+        self.assertEqual(self.module.RestoreOutcome(1, 0, 0, False), run.execute())
+        self.assertEqual("0xa", adapter.windows[0]["address"])
+
+    def test_restore_run_preparation_returns_none_when_windows_are_unavailable(self):
+        unavailable = self.module.ObservationResult(
+            self.module.ObservationStatus.UNAVAILABLE
+        )
+        adapter = self.module.DeterministicHyprland(
+            observation_results={self.module.ObservationKind.WINDOWS: [unavailable]}
+        )
+        self.assertIsNone(
+            self.module.RestoreRun.prepare(
+                self.module.Snapshot(1, [], {}),
+                self.module.RestoreSettings(20, "focused"),
+                compositor=adapter,
+            )
+        )
+        self.assertEqual(
+            [("observe", self.module.ObservationKind.WINDOWS)], adapter.events
+        )
 
     def test_snapshot_value_copies_and_freezes_restore_inputs(self):
-        row = window(1, 0, "terminal", 10)
+        row = window(91, 4, "terminal", 10)
         layout = workspace_layout()
         snapshot = self.module.Snapshot(1, [row], {1: layout})
 
         row["class"] = "changed"
         layout["layout"] = "master"
 
+        self.assertIsInstance(snapshot.windows[0], self.module.SnapshotWindow)
+        self.assertEqual(4, snapshot.windows[0].ord)
+        self.assertEqual(4, snapshot.windows[0].identity)
+        self.assertEqual(4, snapshot.windows[0]["id"])
         self.assertEqual("terminal", snapshot.windows[0]["class"])
         self.assertEqual("dwindle", snapshot.workspace_layouts[1]["layout"])
         with self.assertRaises(TypeError):
             snapshot.windows[0]["class"] = "changed"
+
+    def test_snapshot_rejects_missing_or_duplicate_local_window_identity(self):
+        missing_ord = window(1, 0, "terminal", 10)
+        del missing_ord["ord"]
+        with self.assertRaisesRegex(ValueError, "missing required field 'ord'"):
+            self.module.Snapshot(1, [missing_ord], {})
+
+        first = window(1, 0, "terminal", 10)
+        second = window(2, 0, "browser", 20)
+        with self.assertRaisesRegex(ValueError, "ord values must be unique"):
+            self.module.Snapshot(1, [first, second], {})
 
     def test_restore_settings_reject_invalid_unvalidated_values(self):
         with self.assertRaises(ValueError):
@@ -2139,26 +2927,35 @@ class OmarchySeshTests(unittest.TestCase):
         second.update(group_id=1, group_ord=1)
         clients = [group_client(first, "0xa", []), group_client(second, "0xb", [])]
         messages = []
-        with (
-            mock.patch.object(
-                self.module,
-                "load_workspace_monitor_context",
-                return_value=({}, {}, False),
-            ),
-            mock.patch.object(
-                self.module, "prepare_workspace_monitor", return_value=False
-            ),
-            mock.patch.object(self.module, "place_window") as place,
-            mock.patch.object(self.module, "load_focus_context", return_value={}),
-            mock.patch.object(self.module, "restore_focus_context", return_value=True),
-        ):
-            prepared, compositor = self.prepare_restore(
-                [first, second], clients, write_log=messages.append
-            )
-            outcome = prepared.execute()
+        compositor = self.module.DeterministicHyprland(
+            clients=clients,
+            monitors=[
+                {"id": 0, "name": "DP-1", "description": "Dell Display", "focused": True},
+                {"id": 1, "name": "eDP-1", "description": "Internal"},
+            ],
+            workspaces=[{"id": 1, "monitor": "eDP-1"}],
+            action_results={
+                self.module.MoveWindowToWorkspace: [
+                    self.module.MutationStatus.REJECTED,
+                    self.module.MutationStatus.REJECTED,
+                ]
+            },
+        )
+        prepared = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [first, second], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=compositor,
+            clock=self.module.DeterministicClock(),
+            write_log=messages.append,
+        )
+        outcome = prepared.execute()
         self.assertEqual(self.module.RestoreOutcome(0, 2, 0, False), outcome)
-        place.assert_not_called()
-        self.assertEqual([("clients",), ("getoption", "animations:enabled")], compositor.queries)
+        self.assertFalse(
+            any(
+                event[0] == "action" and isinstance(event[1], self.module.PlaceWindow)
+                for event in compositor.events
+            )
+        )
         self.assertIn("restore: skipping group after failed monitor placement", messages)
 
     def test_window_group_restore_skips_unrelated_existing_group(self):
@@ -2356,251 +3153,132 @@ class OmarchySeshTests(unittest.TestCase):
         second = window(2, 1, "second", 20)
         first.update(at_x=0, at_y=0, size_w=500, size_h=1000, group_id=1, group_ord=0)
         second.update(at_x=0, at_y=0, size_w=500, size_h=1000, group_id=1, group_ord=1)
-        events = []
         clients = [group_client(first, "0xa", []), group_client(second, "0xb", [])]
-        with (
-            mock.patch.object(
-                self.module,
-                "load_workspace_monitor_context",
-                return_value=({}, {}, False),
-            ),
-            mock.patch.object(
-                self.module, "prepare_workspace_monitor", return_value=True
-            ),
-            mock.patch.object(self.module, "place_window", return_value=True),
-            mock.patch.object(
-                self.module,
-                "restore_tiled_slots",
-                side_effect=lambda *_args, **_kwargs: events.append("tiled") or True,
-            ),
-            mock.patch.object(
-                self.module,
-                "restore_window_groups",
-                side_effect=lambda *_args, **_kwargs: events.append("groups") or True,
-            ),
-            mock.patch.object(
-                self.module,
-                "load_focus_context",
-                return_value={"address": "0xa", "workspace_id": 1},
-            ),
-            mock.patch.object(self.module, "restore_focus_context", return_value=True),
-        ):
-            prepared, _ = self.prepare_restore([first, second], clients)
-            outcome = prepared.execute()
+        adapter = self.module.DeterministicHyprland(
+            clients=clients,
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            focus={"window": {"address": "0xa"}, "workspace": {"id": 1}},
+        )
+        prepared = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [first, second], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+        outcome = prepared.execute()
         self.assertEqual(self.module.RestoreOutcome(2, 0, 0, False), outcome)
-        self.assertEqual(["tiled", "groups"], events)
+        group_index = next(
+            index
+            for index, event in enumerate(adapter.events)
+            if event[0] == "action"
+            and isinstance(event[1], self.module.RestoreWindowGroup)
+        )
+        last_place = max(
+            index
+            for index, event in enumerate(adapter.events)
+            if event[0] == "action" and isinstance(event[1], self.module.PlaceWindow)
+        )
+        self.assertLess(last_place, group_index)
+        self.assertEqual(("0xa", "0xb"), adapter.windows[0]["grouped"])
 
     def test_focus_context_ipc_failure_does_not_block_tiled_or_group_restore(self):
         row = window(1, 0, "first", 10)
         row.update(at_x=0, at_y=0, size_w=500, size_h=1000)
-        events = []
         clients = [group_client(row, "0xa", [])]
-        with (
-            mock.patch.object(
-                self.module,
-                "load_workspace_monitor_context",
-                return_value=({}, {}, False),
-            ),
-            mock.patch.object(
-                self.module, "prepare_workspace_monitor", return_value=True
-            ),
-            mock.patch.object(self.module, "place_window", return_value=True),
-            mock.patch.object(
-                self.module,
-                "restore_tiled_slots",
-                side_effect=lambda *_args, **_kwargs: events.append("tiled") or True,
-            ),
-            mock.patch.object(
-                self.module,
-                "restore_window_groups",
-                side_effect=lambda *_args, **_kwargs: events.append("groups") or True,
-            ),
-            mock.patch.object(self.module, "load_focus_context", return_value=None),
-            mock.patch.object(self.module, "restore_focus_context") as restore_focus,
-        ):
-            prepared, _ = self.prepare_restore([row], clients)
-            outcome = prepared.execute()
-        self.assertEqual(self.module.RestoreOutcome(1, 1, 0, False), outcome)
-        self.assertEqual(["tiled", "groups"], events)
-        restore_focus.assert_not_called()
-
-    def run_restore(
-        self,
-        rows,
-        wait_matches=None,
-        dispatch_result=True,
-        place_result=True,
-        clients=None,
-        appearances=None,
-        appearance_workspaces=None,
-        events=None,
-        monitor_context=({}, {}, False),
-        monitor_prepare_result=None,
-        track_monitor=False,
-        tiled_matches=None,
-        tiled_result=True,
-        group_result=True,
-        sleep_intervals=None,
-        log_messages=None,
-    ):
-        clients = clients or []
-        wait_matches = wait_matches or {}
-        appearances = appearances or {row_id: 1 for row_id in wait_matches}
-        appearance_workspaces = appearance_workspaces or {}
-        events = events if events is not None else []
-        now = [0.0]
-        prepare_workspace_monitor = self.module.prepare_workspace_monitor
-
-        def make_client(row, address):
-            return {
-                "mapped": True,
-                "address": address,
-                "class": row["class"],
-                "initialClass": row["initial_class"],
-                "title": row["title"],
-                "initialTitle": row["initial_title"],
-                "workspace": {
-                    "id": appearance_workspaces.get(row["id"], row["workspace_id"])
-                },
-            }
-
-        calls = [0]
-
-        def current_clients():
-            calls[0] += 1
-            events.append("initial-scan" if calls[0] == 1 else "poll")
-            visible = list(clients)
-            for row in rows:
-                threshold = appearances.get(row["id"])
-                if threshold is not None and dispatch.call_count >= threshold:
-                    visible.append(make_client(row, wait_matches[row["id"]]))
-            return visible
-
-        def run_dispatch(_lua, failure_context=None):
-            if "exec_cmd" in _lua:
-                self.assertEqual("restore: application launch", failure_context)
-            events.append("dispatch")
-            return dispatch_result
-
-        def advance(seconds):
-            if sleep_intervals is not None:
-                sleep_intervals.append(seconds)
-            now[0] += seconds
-
-        def run_monitor_prepare(*args, **kwargs):
-            if track_monitor:
-                events.append("monitor-prepare")
-            if monitor_prepare_result is not None:
-                return monitor_prepare_result
-            return prepare_workspace_monitor(*args, **kwargs)
-
-        def run_tiled_restore(_rows, _matches, _clients, *_args, **_kwargs):
-            events.append("tiled-restore")
-            if tiled_matches is not None:
-                tiled_matches.append(dict(_matches))
-            return tiled_result
-
-        dispatch = mock.Mock(side_effect=run_dispatch)
-
-        class InMemoryCompositor:
-            def query_json(self, endpoint, *_args):
-                if endpoint == "clients":
-                    return current_clients()
-                if endpoint == "getoption":
-                    return {"int": 0}
-                raise AssertionError(f"unexpected endpoint: {endpoint}")
-
-            def query_batch_json(self, *_commands):
-                raise AssertionError("unexpected batch query")
-
-            def dispatch(self, lua, failure_context=None):
-                return dispatch(lua, failure_context=failure_context)
-
-            def evaluate(self, _lua):
-                return True
-
-        class InMemoryClock:
-            def monotonic(self):
-                return now[0]
-
-            def sleep(self, seconds):
-                advance(seconds)
-
-        def run_place(row, _address, _current=None, **_kwargs):
-            events.append(f"place:{row['id']}")
-            return place_result
-
-        messages = log_messages if log_messages is not None else []
-        with (
-            mock.patch.object(
-                self.module, "place_window", side_effect=run_place
-            ) as place,
-            mock.patch.object(
-                self.module,
-                "load_workspace_monitor_context",
-                return_value=monitor_context,
-            ),
-            mock.patch.object(
-                self.module,
-                "prepare_workspace_monitor",
-                side_effect=run_monitor_prepare,
-            ),
-            mock.patch.object(
-                self.module, "restore_tiled_slots", side_effect=run_tiled_restore
-            ),
-            mock.patch.object(
-                self.module, "restore_window_groups", return_value=group_result
-            ),
-            mock.patch.object(
-                self.module,
-                "load_focus_context",
-                return_value={"address": "0xfocused", "workspace_id": 1},
-            ),
-            mock.patch.object(self.module, "restore_focus_context", return_value=True),
-        ):
-            snapshot = self.module.Snapshot(1, rows, {})
-            prepared = self.module.RestoreRun(
-                compositor=InMemoryCompositor(),
-                clock=InMemoryClock(),
-                write_log=messages.append,
-            ).prepare(
-                snapshot,
-                self.module.RestoreSettings(
-                    self.module.RESTORE_TIMEOUT, "focused"
-                ),
-            )
-            self.assertIsNotNone(prepared)
-            outcome = prepared.execute()
-        result = (
-            75
-            if outcome.retryable_failure
-            else 1
-            if outcome.permanent_failures
-            else 0
+        unavailable = self.module.ObservationResult(
+            self.module.ObservationStatus.UNAVAILABLE
         )
-        return result, dispatch, place
+        adapter = self.module.DeterministicHyprland(
+            clients=clients,
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            observation_results={self.module.ObservationKind.FOCUS: [unavailable]},
+        )
+        prepared = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [row], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+        outcome = prepared.execute()
+        self.assertEqual(self.module.RestoreOutcome(1, 0, 0, True), outcome)
+        focus_index = adapter.events.index(
+            ("observe", self.module.ObservationKind.FOCUS)
+        )
+        later_windows = [
+            index
+            for index, event in enumerate(adapter.events)
+            if event == ("observe", self.module.ObservationKind.WINDOWS)
+            and index > focus_index
+        ]
+        self.assertTrue(later_windows)
+
+    def test_focus_observation_failure_returns_75_and_keeps_autosave_gated(self):
+        row = window(1, 0, "terminal", 10)
+        sid = self.record_snapshot("periodic", "complete", "", [row])
+        unavailable = self.module.ObservationResult(
+            self.module.ObservationStatus.UNAVAILABLE
+        )
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0xa", [])],
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            observation_results={self.module.ObservationKind.FOCUS: [unavailable]},
+        )
+        run = self.module.RestoreRun.prepare(
+            self.module.Snapshot(sid, [row], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=adapter,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+        lock_file = mock.Mock()
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+            ),
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module.RestoreRun, "prepare", return_value=run),
+            mock.patch.object(self.module, "restore_was_completed", return_value=False),
+        ):
+            result = self.module.cmd_restore()
+
+        self.assertEqual(75, result)
+        self.assertFalse(self.module.restore_is_ready())
 
     def test_browser_process_launches_once_and_places_two_windows(self):
         rows = [window(1, 0, "chromium", 10), window(2, 1, "slack-webapp", 10)]
-        result, dispatch, place = self.run_restore(rows, {1: "0x1", 2: "0x2"})
-        self.assertEqual(0, result)
-        self.assertEqual(1, dispatch.call_count)
-        self.assertEqual(2, place.call_count)
+        adapter = self.module.DeterministicHyprland(
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            launch_appearances={
+                1: [group_client(rows[0], "0x1", []), group_client(rows[1], "0x2", [])]
+            },
+        )
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, rows, {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(2, 0, 1, False), outcome)
+        self.assertEqual(1, sum(isinstance(e[1], self.module.LaunchApplication) for e in adapter.events if e[0] == "action"))
 
     def test_process_group_relaunches_for_a_still_missing_window(self):
         rows = [window(1, 0, "files", 10), window(2, 1, "files", 10)]
-        sleep_intervals = []
-        result, dispatch, place = self.run_restore(
-            rows,
-            {1: "0x1", 2: "0x2"},
-            appearances={1: 1, 2: 2},
-            sleep_intervals=sleep_intervals,
+        adapter = self.module.DeterministicHyprland(
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            launch_appearances={
+                1: [group_client(rows[0], "0x1", [])],
+                2: [group_client(rows[1], "0x2", [])],
+            },
         )
-        self.assertEqual(0, result)
-        self.assertEqual(2, dispatch.call_count)
-        self.assertEqual(2, place.call_count)
-        self.assertTrue(sleep_intervals)
-        self.assertEqual({self.module.RESTORE_POLL_INTERVAL}, set(sleep_intervals))
+        outcome, clock = self.execute_scenario(self.module.Snapshot(1, rows, {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(2, 0, 2, False), outcome)
+        sleeps = [seconds for event, seconds in clock.events if event == "sleep"]
+        self.assertTrue(sleeps)
+        self.assertEqual({self.module.RESTORE_POLL_INTERVAL}, set(sleeps))
         self.assertEqual(0.05, self.module.RESTORE_POLL_INTERVAL)
 
     def test_existing_workspace_match_avoids_duplicate_launch(self):
@@ -2613,17 +3291,21 @@ class OmarchySeshTests(unittest.TestCase):
             "title": "Changed",
             "workspace": {"id": 1},
         }
-        result, dispatch, place = self.run_restore([row], clients=[client])
-        self.assertEqual(0, result)
-        dispatch.assert_not_called()
-        place.assert_called_once()
+        adapter = self.module.DeterministicHyprland(
+            clients=[client], monitors=[{"id": 0, "name": "DP-1", "focused": True}], workspaces=[{"id": 1, "monitor": "DP-1"}]
+        )
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [row], {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(1, 0, 0, False), outcome)
+        self.assertFalse(any(isinstance(e[1], self.module.LaunchApplication) for e in adapter.events if e[0] == "action"))
 
     def test_same_class_different_processes_launch_twice(self):
         rows = [window(1, 0, "terminal", 10), window(2, 1, "terminal", 20)]
-        result, dispatch, place = self.run_restore(rows, {1: "0x1", 2: "0x2"})
-        self.assertEqual(0, result)
-        self.assertEqual(2, dispatch.call_count)
-        self.assertEqual(2, place.call_count)
+        adapter = self.module.DeterministicHyprland(
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}], workspaces=[{"id": 1, "monitor": "DP-1"}],
+            launch_appearances={1: [group_client(rows[0], "0x1", [])], 2: [group_client(rows[1], "0x2", [])]},
+        )
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, rows, {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(2, 0, 2, False), outcome)
 
     def test_all_missing_groups_launch_before_first_poll(self):
         browser = window(1, 0, "chromium", 10)
@@ -2634,18 +3316,16 @@ class OmarchySeshTests(unittest.TestCase):
             10,
             initial_title="discord.com_/channels/@me",
         )
-        events = []
-
-        result, dispatch, place = self.run_restore(
-            [browser, webapp],
-            wait_matches={1: "0x1", 2: "0x2"},
-            events=events,
+        adapter = self.module.DeterministicHyprland(
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}], workspaces=[{"id": 1, "monitor": "DP-1"}],
+            launch_appearances={1: [group_client(browser, "0x1", [])], 2: [group_client(webapp, "0x2", [])]},
         )
-
-        self.assertEqual(0, result)
-        self.assertEqual(2, dispatch.call_count)
-        self.assertEqual(2, place.call_count)
-        self.assertEqual(["initial-scan", "dispatch", "dispatch", "poll"], events[:4])
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [browser, webapp], {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(2, 0, 2, False), outcome)
+        actions = [event[1] for event in adapter.events if event[0] == "action"]
+        first_observation_after_mutation = adapter.events.index(("observe", self.module.ObservationKind.WINDOWS), 1)
+        self.assertTrue(all(isinstance(action, self.module.LaunchApplication) for action in actions[:2]))
+        self.assertLess(adapter.events.index(("action", actions[1])), first_observation_after_mutation)
 
     def test_tiled_workspace_is_corrected_before_unrelated_window_times_out(self):
         first = window(1, 0, "left", 10)
@@ -2654,47 +3334,33 @@ class OmarchySeshTests(unittest.TestCase):
         first.update(at_x=0, at_y=0, size_w=500, size_h=1000)
         second.update(at_x=500, at_y=0, size_w=500, size_h=1000)
         slow["workspace_id"] = 2
-        events = []
-
-        with mock.patch.object(
-            self.module,
-            "restore_tiled_layouts",
-            side_effect=lambda *_args, **_kwargs: events.append("tiled") or True,
-        ):
-            result, _dispatch, _place = self.run_restore(
-                [first, second, slow],
-                wait_matches={2: "0x2", 3: "0x3"},
-                appearances={2: 2, 3: 4},
-                clients=[
-                    {
-                        "mapped": True,
-                        "address": "0x1",
-                        "class": first["class"],
-                        "initialClass": first["initial_class"],
-                        "title": first["title"],
-                        "initialTitle": first["initial_title"],
-                        "workspace": {"id": 1},
-                    }
-                ],
-                events=events,
-            )
-
-        self.assertEqual(1, result)
-        self.assertIn("tiled", events)
-        polls = [index for index, event in enumerate(events) if event == "poll"]
-        self.assertGreaterEqual(len(polls), 2)
-        self.assertLess(events.index("tiled"), polls[1])
+        current_first = tiled_client(first, "0x1", [500, 0], [500, 1000])
+        current_second = tiled_client(second, "0x2", [0, 0], [500, 1000])
+        adapter = self.module.DeterministicHyprland(
+            clients=[current_first], monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}, {"id": 2, "monitor": "DP-1"}],
+            launch_appearances={1: [current_second]},
+            action_results={self.module.LaunchApplication: [self.module.MutationStatus.APPLIED, self.module.MutationStatus.REJECTED]},
+        )
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [first, second, slow], {}), adapter)
+        self.assertEqual(2, outcome.restored_windows)
+        self.assertEqual(1, outcome.permanent_failures)
+        swap_index = next(i for i, e in enumerate(adapter.events) if e[0] == "action" and isinstance(e[1], self.module.SwapWindows))
+        self.assertLess(swap_index, len(adapter.events) - 1)
 
     def test_launched_window_is_discovered_before_workspace_placement(self):
         row = window(1, 0, "terminal", 10, title="Saved")
-        result, dispatch, place = self.run_restore(
-            [row],
-            wait_matches={1: "0x1"},
-            appearance_workspaces={1: 2},
+        appeared = group_client(row, "0x1", [])
+        appeared["workspace"] = {"id": 2}
+        adapter = self.module.DeterministicHyprland(
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}], workspaces=[{"id": 1, "monitor": "DP-1"}, {"id": 2, "monitor": "DP-1"}],
+            launch_appearances={1: [appeared]},
         )
-        self.assertEqual(0, result)
-        self.assertEqual(1, dispatch.call_count)
-        place.assert_called_once()
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [row], {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(1, 0, 1, False), outcome)
+        placement = next(e[1] for e in adapter.events if e[0] == "action" and isinstance(e[1], self.module.PlaceWindow))
+        self.assertEqual(2, placement.current["workspace"]["id"])
+        self.assertEqual(1, adapter.windows[0]["workspace"]["id"])
 
     def nested_workspace(self):
         left = window(1, 0, "left", 10)
@@ -2887,6 +3553,90 @@ class OmarchySeshTests(unittest.TestCase):
             ({"address": "0xfocused", "workspace_id": 2},),
             restore_focus.call_args.args,
         )
+
+    def test_restore_run_replays_two_window_geometry_with_deterministic_adapter(self):
+        left = window(1, 0, "left", 10)
+        right = window(2, 1, "right", 20)
+        left.update(at_x=0, at_y=0, size_w=300, size_h=1000)
+        right.update(at_x=300, at_y=0, size_w=700, size_h=1000)
+        current = [
+            tiled_client(left, "0xleft", [0, 0], [500, 1000]),
+            tiled_client(right, "0xright", [500, 0], [500, 1000]),
+        ]
+        workspaces, monitors = live_workspace_context()
+        monitors[0]["focused"] = True
+        adapter = self.module.DeterministicHyprland(
+            clients=current,
+            monitors=monitors,
+            workspaces=workspaces,
+            focus={"window": {"address": "0xleft"}, "workspace": {"id": 1}},
+        )
+
+        outcome, _ = self.execute_scenario(
+            self.module.Snapshot(1, [left, right], {1: workspace_layout()}),
+            adapter,
+        )
+
+        self.assertEqual(self.module.RestoreOutcome(2, 0, 0, False), outcome)
+        by_address = {client["address"]: client for client in adapter.windows}
+        self.assertEqual((0, 0, 300, 1000), self.module.window_geometry(by_address["0xleft"]))
+        self.assertEqual((300, 0, 700, 1000), self.module.window_geometry(by_address["0xright"]))
+        replay_index = next(
+            index
+            for index, event in enumerate(adapter.events)
+            if event[0] == "action"
+            and isinstance(event[1], self.module.ReplayWorkspaceTree)
+        )
+        last_place = max(
+            index
+            for index, event in enumerate(adapter.events)
+            if event[0] == "action" and isinstance(event[1], self.module.PlaceWindow)
+        )
+        verification = adapter.events.index(
+            ("observe", self.module.ObservationKind.WINDOWS), replay_index
+        )
+        self.assertLess(last_place, replay_index)
+        self.assertLess(replay_index, verification)
+
+    def test_restore_run_classifies_deterministic_replay_failures(self):
+        expected = {
+            self.module.MutationStatus.REJECTED: self.module.RestoreOutcome(
+                2, 1, 0, False
+            ),
+            self.module.MutationStatus.UNAVAILABLE: self.module.RestoreOutcome(
+                2, 0, 0, True
+            ),
+        }
+        for status, expected_outcome in expected.items():
+            with self.subTest(status=status):
+                left = window(1, 0, "left", 10)
+                right = window(2, 1, "right", 20)
+                left.update(at_x=0, at_y=0, size_w=300, size_h=1000)
+                right.update(at_x=300, at_y=0, size_w=700, size_h=1000)
+                workspaces, monitors = live_workspace_context()
+                monitors[0]["focused"] = True
+                adapter = self.module.DeterministicHyprland(
+                    clients=[
+                        tiled_client(left, "0xleft", [0, 0], [500, 1000]),
+                        tiled_client(right, "0xright", [500, 0], [500, 1000]),
+                    ],
+                    monitors=monitors,
+                    workspaces=workspaces,
+                    focus={
+                        "window": {"address": "0xleft"},
+                        "workspace": {"id": 1},
+                    },
+                    action_results={self.module.ReplayWorkspaceTree: [status]},
+                )
+
+                outcome, _ = self.execute_scenario(
+                    self.module.Snapshot(
+                        1, [left, right], {1: workspace_layout()}
+                    ),
+                    adapter,
+                )
+
+                self.assertEqual(expected_outcome, outcome)
 
     def test_two_window_vertical_replay_uses_exact_saved_ratio(self):
         top = window(1, 0, "top", 10)
@@ -3095,7 +3845,8 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module.restore_tiled_layouts(rows, {1: "0xleft"}, clients, {})
             )
         slots.assert_called_once()
-        self.assertEqual((rows, {1: "0xleft"}, clients), slots.call_args.args)
+        self.assertEqual((rows, {1: "0xleft"}), slots.call_args.args[:2])
+        self.assertEqual("0xleft", slots.call_args.args[2][0]["address"])
 
     def test_nested_replay_ipc_failure_is_retryable(self):
         rows = self.nested_workspace()
@@ -3137,8 +3888,8 @@ class OmarchySeshTests(unittest.TestCase):
             }
         ]
         with (
-            mock.patch.object(self.module, "hyprctl_json", side_effect=[clients, None]),
-            mock.patch.object(self.module, "dispatch", return_value=False),
+            mock.patch.object(self.module, "hyprctl_json", return_value=clients),
+            mock.patch.object(self.module, "dispatch", return_value=None),
         ):
             self.assertIsNone(
                 self.module.recover_replay_workspace(
@@ -3617,15 +4368,13 @@ class OmarchySeshTests(unittest.TestCase):
 
         with (
             mock.patch.object(self.module, "dispatch", return_value=False) as dispatch,
-            mock.patch.object(
-                self.module, "hyprctl_json", return_value=clients
-            ) as hyprctl,
+            mock.patch.object(self.module, "hyprctl_json") as hyprctl,
         ):
             self.assertFalse(
                 self.module.restore_tiled_slots([left, right], matches, clients)
             )
         self.assertEqual(1, dispatch.call_count)
-        hyprctl.assert_called_once_with("clients")
+        hyprctl.assert_not_called()
 
     def test_tiled_slot_resize_transport_failure_is_retryable(self):
         left = window(1, 0, "left", 10)
@@ -3638,8 +4387,7 @@ class OmarchySeshTests(unittest.TestCase):
         ]
 
         with (
-            mock.patch.object(self.module, "dispatch", return_value=False),
-            mock.patch.object(self.module, "hyprctl_json", return_value=None),
+            mock.patch.object(self.module, "dispatch", return_value=None),
         ):
             self.assertIsNone(
                 self.module.restore_tiled_slots(
@@ -3759,13 +4507,11 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(
                 self.module, "dispatch", side_effect=[False, True]
             ) as dispatch,
-            mock.patch.object(
-                self.module, "hyprctl_json", return_value=clients
-            ) as hyprctl,
+            mock.patch.object(self.module, "hyprctl_json") as hyprctl,
         ):
             self.assertFalse(self.module.restore_tiled_slots(rows, matches, clients))
         self.assertEqual(2, dispatch.call_count)
-        hyprctl.assert_called_once_with("clients")
+        hyprctl.assert_not_called()
 
     def test_tiled_slot_swap_transport_failure_is_retryable(self):
         left = window(1, 0, "left", 10)
@@ -3778,8 +4524,7 @@ class OmarchySeshTests(unittest.TestCase):
         ]
 
         with (
-            mock.patch.object(self.module, "dispatch", return_value=False),
-            mock.patch.object(self.module, "hyprctl_json", return_value=None),
+            mock.patch.object(self.module, "dispatch", return_value=None),
         ):
             self.assertIsNone(
                 self.module.restore_tiled_slots(
@@ -3807,22 +4552,17 @@ class OmarchySeshTests(unittest.TestCase):
             window(1, 0, "slow-app", 10),
             window(2, 1, "fast-app", 20),
         ]
-        events = []
-
-        result, dispatch, place = self.run_restore(
-            rows,
-            wait_matches={2: "0x2"},
-            appearances={2: 1},
-            events=events,
+        adapter = self.module.DeterministicHyprland(
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            launch_appearances={2: [group_client(rows[1], "0x2", [])]},
         )
-
-        self.assertEqual(1, result)
-        self.assertEqual(2, dispatch.call_count)
-        place.assert_called_once()
-        self.assertEqual(
-            ["initial-scan", "dispatch", "dispatch", "poll", "place:2"],
-            events[:5],
-        )
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, rows, {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(1, 1, 2, False), outcome)
+        actions = [event[1] for event in adapter.events if event[0] == "action"]
+        self.assertIsInstance(actions[0], self.module.LaunchApplication)
+        self.assertIsInstance(actions[1], self.module.LaunchApplication)
+        self.assertIsInstance(actions[2], self.module.PlaceWindow)
 
     def test_partial_process_group_waits_then_launches_once(self):
         rows = [
@@ -3840,22 +4580,26 @@ class OmarchySeshTests(unittest.TestCase):
                 "workspace": {"id": 1},
             }
         ]
-        result, dispatch, place = self.run_restore(
-            rows,
+        adapter = self.module.DeterministicHyprland(
             clients=clients,
-            wait_matches={2: "0x2"},
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            launch_appearances={1: [group_client(rows[1], "0x2", [])]},
         )
-        self.assertEqual(0, result)
-        self.assertEqual(1, dispatch.call_count)
-        self.assertEqual(2, place.call_count)
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, rows, {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(2, 0, 1, False), outcome)
 
     def test_dispatch_failure_returns_nonzero(self):
-        result, dispatch, place = self.run_restore(
-            [window(1, 0, "terminal", 10)], dispatch_result=False
+        row = window(1, 0, "terminal", 10)
+        adapter = self.module.DeterministicHyprland(
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            action_results={
+                self.module.LaunchApplication: [self.module.MutationStatus.REJECTED]
+            },
         )
-        self.assertEqual(1, result)
-        self.assertEqual(1, dispatch.call_count)
-        place.assert_not_called()
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [row], {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(0, 1, 0, False), outcome)
 
     def test_launch_failures_do_not_log_the_saved_command(self):
         secret = "credential=do-not-log"
@@ -3878,78 +4622,91 @@ class OmarchySeshTests(unittest.TestCase):
         row["cmdline"] = f"/usr/bin/example --token {secret}"
         messages = []
 
-        result, _, _ = self.run_restore([row], log_messages=messages)
+        adapter = self.module.DeterministicHyprland(
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+        )
+        outcome, _ = self.execute_scenario(
+            self.module.Snapshot(1, [row], {}), adapter, messages=messages
+        )
 
-        self.assertEqual(1, result)
+        self.assertEqual(self.module.RestoreOutcome(0, 1, 1, False), outcome)
         self.assertNotIn(secret, "\n".join(messages))
         self.assertIn("restore: no window appeared for terminal", messages)
 
     def test_monitor_move_failure_makes_restore_nonretryable(self):
         row = window(1, 0, "terminal", 10)
         row.update(at_x=0, at_y=0, size_w=1000, size_h=1000)
-        tiled_matches = []
-        result, _, place = self.run_restore(
-            [row],
-            {1: "0x1"},
-            monitor_prepare_result=False,
-            tiled_matches=tiled_matches,
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0x1", [])],
+            monitors=[{"id": 0, "name": "DP-1", "description": "Dell Display", "focused": True}, {"id": 1, "name": "eDP-1"}],
+            workspaces=[{"id": 1, "monitor": "eDP-1"}],
+            action_results={self.module.MoveWindowToWorkspace: [self.module.MutationStatus.REJECTED]},
         )
-        self.assertEqual(1, result)
-        place.assert_not_called()
-        self.assertEqual([{}], tiled_matches)
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [row], {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(0, 1, 0, False), outcome)
+        self.assertFalse(any(isinstance(e[1], self.module.PlaceWindow) for e in adapter.events if e[0] == "action"))
 
     def test_monitor_ipc_failure_makes_restore_retryable(self):
-        result, _, _ = self.run_restore(
-            [window(1, 0, "terminal", 10)],
-            {1: "0x1"},
-            monitor_context=({}, {}, True),
+        row = window(1, 0, "terminal", 10)
+        unavailable = self.module.ObservationResult(self.module.ObservationStatus.UNAVAILABLE)
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0x1", [])],
+            observation_results={self.module.ObservationKind.DISPLAYS: [unavailable]},
         )
-        self.assertEqual(75, result)
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [row], {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(0, 1, 0, True), outcome)
 
     def test_group_restore_ipc_failure_makes_restore_retryable(self):
-        result, _, _ = self.run_restore(
-            [window(1, 0, "terminal", 10)],
-            {1: "0x1"},
-            group_result=None,
+        row = window(1, 0, "terminal", 10)
+        row.update(group_id=1, group_ord=0)
+        unavailable = self.module.ObservationResult(self.module.ObservationStatus.UNAVAILABLE)
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0x1", [])],
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            observation_results={self.module.ObservationKind.VERSION: [unavailable]},
         )
-        self.assertEqual(75, result)
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [row], {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(1, 0, 0, True), outcome)
 
     def test_monitor_remap_runs_before_window_state_and_tiled_slot_restore(self):
         row = window(1, 0, "terminal", 10)
         row.update(at_x=0, at_y=0, size_w=1000, size_h=1000)
-        events = []
-
-        result, _, _ = self.run_restore(
-            [row],
-            {1: "0x1"},
-            events=events,
-            monitor_context=({1: "DP-1"}, {1: "eDP-1"}, False),
-            track_monitor=True,
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0x1", [])],
+            monitors=[{"id": 0, "name": "DP-1", "description": "Dell Display", "focused": True}, {"id": 1, "name": "eDP-1"}],
+            workspaces=[{"id": 1, "monitor": "eDP-1"}],
         )
-
-        self.assertEqual(0, result)
-        self.assertLess(events.index("monitor-prepare"), events.index("place:1"))
-        self.assertLess(events.index("monitor-prepare"), events.index("tiled-restore"))
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [row], {}), adapter)
+        self.assertEqual(self.module.RestoreOutcome(1, 0, 0, False), outcome)
+        move = next(i for i, e in enumerate(adapter.events) if e[0] == "action" and isinstance(e[1], self.module.MoveWorkspaceToDisplay))
+        refresh = adapter.events.index(("observe", self.module.ObservationKind.WINDOWS), move)
+        place = next(i for i, e in enumerate(adapter.events) if e[0] == "action" and isinstance(e[1], self.module.PlaceWindow))
+        self.assertLess(move, refresh)
+        self.assertLess(refresh, place)
 
     def test_tiled_refresh_ipc_failure_makes_restore_retryable(self):
         row = window(1, 0, "terminal", 10)
         row.update(at_x=0, at_y=0, size_w=1000, size_h=1000)
-        result, _, _ = self.run_restore([row], {1: "0x1"}, tiled_result=None)
-        self.assertEqual(75, result)
+        client = tiled_client(row, "0x1", [0, 0], [1000, 1000])
+        unavailable = self.module.ObservationResult(self.module.ObservationStatus.UNAVAILABLE)
+        adapter = self.module.DeterministicHyprland(
+            clients=[client], monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+            window_observations=[[client], unavailable],
+        )
+        outcome, _ = self.execute_scenario(self.module.Snapshot(1, [row], {}), adapter)
+        self.assertTrue(outcome.retryable_failure)
 
     def test_initial_ipc_failure_returns_nonzero_without_dispatch(self):
-        connection = mock.Mock()
+        self.record_snapshot(
+            "periodic", "complete", "", [window(1, 0, "terminal", 10)]
+        )
         lock_file = mock.Mock()
         with (
             mock.patch.object(
                 self.module, "acquire_operation_lock", return_value=lock_file
-            ),
-            mock.patch.object(self.module, "db_conn", return_value=connection),
-            mock.patch.object(
-                self.module, "latest_session", return_value=(1, "periodic", "now")
-            ),
-            mock.patch.object(
-                self.module, "load_windows", return_value=[window(1, 0, "terminal", 10)]
             ),
             mock.patch.object(self.module, "hyprctl_json", return_value=None),
             mock.patch.object(self.module, "dispatch") as dispatch,
@@ -3959,16 +4716,14 @@ class OmarchySeshTests(unittest.TestCase):
         dispatch.assert_not_called()
 
     def test_restore_uses_configured_timeout_and_monitor_fallback(self):
-        self.module.persist_snapshot(
+        self.record_snapshot(
             "periodic", "complete", "", [window(1, 0, "terminal", 10)]
         )
         cfg = dict(self.module.DEFAULT_CONFIG)
         cfg.update(restore_timeout_seconds=37.5, monitor_fallback="DP-2")
         lock_file = mock.Mock()
-        observation = mock.Mock()
         prepared = mock.Mock()
         prepared.execute.return_value = self.module.RestoreOutcome(1, 0, 1, False)
-        observation.prepare.return_value = prepared
         with (
             mock.patch.dict(
                 os.environ,
@@ -3980,24 +4735,92 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module, "acquire_operation_lock", return_value=lock_file
             ),
             mock.patch.object(
-                self.module.RestoreRun, "observe", return_value=observation
-            ),
+                self.module.RestoreRun, "prepare", return_value=prepared
+            ) as prepare,
             mock.patch.object(self.module, "restore_was_completed", return_value=False),
             mock.patch.object(self.module, "mark_restore_completed", return_value=True),
         ):
             result = self.module.cmd_restore()
 
         self.assertEqual(0, result)
-        settings = observation.prepare.call_args.args[1]
+        settings = prepare.call_args.args[1]
         self.assertEqual(37.5, settings.timeout_seconds)
         self.assertEqual("DP-2", settings.monitor_fallback)
 
     def test_restore_places_windows_with_animations_suppressed(self):
-        self.module.persist_snapshot(
+        row = window(1, 0, "terminal", 10)
+        client = group_client(row, "0xa", [])
+        compositor = self.module.DeterministicHyprland(
+            clients=[client],
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+        )
+        run = self.module.RestoreRun.prepare(
+            self.module.Snapshot(1, [row], {}),
+            self.module.RestoreSettings(20, "focused"),
+            compositor=compositor,
+            clock=self.module.DeterministicClock(),
+            write_log=lambda _message: None,
+        )
+
+        self.assertTrue(compositor.animations)
+        self.assertEqual(self.module.RestoreOutcome(1, 0, 0, False), run.execute())
+        self.assertTrue(compositor.animations)
+        place_index = next(
+            index
+            for index, event in enumerate(compositor.events)
+            if event[0] == "action" and isinstance(event[1], self.module.PlaceWindow)
+        )
+        self.assertLess(compositor.events.index(("mutations", "begin")), place_index)
+        self.assertEqual(("mutations", "end"), compositor.events[-1])
+
+    def test_restore_command_orders_observation_markers_and_mutation_scope(self):
+        row = window(1, 0, "terminal", 10)
+        self.record_snapshot("periodic", "complete", "", [row])
+        adapter = self.module.DeterministicHyprland(
+            clients=[group_client(row, "0xa", [])],
+            monitors=[{"id": 0, "name": "DP-1", "focused": True}],
+            workspaces=[{"id": 1, "monitor": "DP-1"}],
+        )
+        lock_file = mock.Mock()
+
+        def persist_marker(_session_id, complete=True):
+            adapter.events.append(("marker", complete, adapter.animations))
+            return True
+
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+            ),
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module, "ProductionHyprland", return_value=adapter),
+            mock.patch.object(self.module, "restore_was_completed", return_value=False),
+            mock.patch.object(
+                self.module, "mark_restore_completed", side_effect=persist_marker
+            ),
+        ):
+            result = self.module.cmd_restore()
+
+        initial_observation = adapter.events.index(
+            ("observe", self.module.ObservationKind.WINDOWS)
+        )
+        incomplete_marker = adapter.events.index(("marker", False, True))
+        mutation_begin = adapter.events.index(("mutations", "begin"))
+        mutation_end = adapter.events.index(("mutations", "end"))
+        complete_marker = adapter.events.index(("marker", True, True))
+
+        self.assertEqual(0, result)
+        self.assertLess(initial_observation, incomplete_marker)
+        self.assertLess(incomplete_marker, mutation_begin)
+        self.assertLess(mutation_end, complete_marker)
+
+    def test_dry_run_does_not_touch_animations(self):
+        self.record_snapshot(
             "periodic", "complete", "", [window(1, 0, "terminal", 10)]
         )
         lock_file = mock.Mock()
-        events = []
         with (
             mock.patch.dict(
                 os.environ,
@@ -4007,68 +4830,6 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(
                 self.module, "acquire_operation_lock", return_value=lock_file
             ),
-            mock.patch.object(
-                self.module,
-                "hyprctl_json",
-                side_effect=lambda *_args: events.append("observe") or [],
-            ),
-            mock.patch.object(self.module, "restore_was_completed", return_value=False),
-            mock.patch.object(self.module, "animations_enabled", return_value=True),
-            mock.patch.object(
-                self.module,
-                "set_animations_enabled",
-                side_effect=lambda enabled, **_kwargs: (
-                    events.append(f"animations={enabled}") or True
-                ),
-            ),
-            mock.patch.object(
-                self.module,
-                "_execute_restore",
-                side_effect=lambda *_a: events.append("restore")
-                or (1, 0, 1, False),
-            ),
-            mock.patch.object(
-                self.module,
-                "mark_restore_completed",
-                side_effect=lambda _sid, complete=True: (
-                    events.append(f"marker={complete}") or True
-                ),
-            ),
-        ):
-            self.assertEqual(0, self.module.cmd_restore())
-
-        self.assertEqual(
-            [
-                "observe",
-                "marker=False",
-                "animations=False",
-                "restore",
-                "animations=True",
-                "marker=True",
-            ],
-            events,
-        )
-
-    def test_dry_run_does_not_touch_animations(self):
-        connection = mock.Mock()
-        lock_file = mock.Mock()
-        with (
-            mock.patch.dict(
-                os.environ,
-                {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
-                clear=False,
-            ),
-            mock.patch.object(
-                self.module, "acquire_operation_lock", return_value=lock_file
-            ),
-            mock.patch.object(self.module, "db_conn", return_value=connection),
-            mock.patch.object(
-                self.module, "latest_session", return_value=(1, "periodic", "now")
-            ),
-            mock.patch.object(
-                self.module, "load_windows", return_value=[window(1, 0, "terminal", 10)]
-            ),
-            mock.patch.object(self.module, "load_workspace_layouts", return_value={}),
             mock.patch.object(self.module, "hyprctl_json", return_value=[]),
             mock.patch.object(self.module, "set_animations_enabled") as keyword,
         ):
@@ -4076,15 +4837,12 @@ class OmarchySeshTests(unittest.TestCase):
         keyword.assert_not_called()
 
     def test_no_session_without_compositor_requests_retry(self):
-        connection = mock.Mock()
         lock_file = mock.Mock()
         with (
             mock.patch.dict(os.environ, {}, clear=True),
             mock.patch.object(
                 self.module, "acquire_operation_lock", return_value=lock_file
             ),
-            mock.patch.object(self.module, "db_conn", return_value=connection),
-            mock.patch.object(self.module, "latest_session", return_value=None),
             mock.patch.object(self.module, "hyprctl_json") as hyprctl,
         ):
             result = self.module.cmd_restore()
@@ -4105,63 +4863,43 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertEqual(75, self.module.cmd_restore())
 
     def test_completed_restore_marker_skips_relaunch_in_same_desktop(self):
-        connection = mock.Mock()
+        sid = self.record_snapshot(
+            "periodic", "complete", "", [window(1, 0, "terminal", 10)]
+        )
         lock_file = mock.Mock()
         with mock.patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}):
-            self.module.mark_restore_completed(7)
+            self.module.mark_restore_completed(sid)
             with (
                 mock.patch.object(
                     self.module, "acquire_operation_lock", return_value=lock_file
                 ),
-                mock.patch.object(self.module, "db_conn", return_value=connection),
-                mock.patch.object(
-                    self.module, "latest_session", return_value=(7, "periodic", "now")
-                ),
                 mock.patch.object(self.module, "hyprctl_json", return_value=[]),
-                mock.patch.object(
-                    self.module,
-                    "load_windows",
-                ) as load_windows,
-                mock.patch.object(
-                    self.module, "load_workspace_layouts", return_value={}
-                ),
                 mock.patch.object(self.module, "dispatch") as dispatch,
             ):
                 result = self.module.cmd_restore()
         self.assertEqual(0, result)
-        load_windows.assert_not_called()
         dispatch.assert_not_called()
 
     def test_completed_marker_still_requires_live_compositor(self):
-        connection = mock.Mock()
+        sid = self.record_snapshot(
+            "periodic", "complete", "", [window(1, 0, "terminal", 10)]
+        )
         lock_file = mock.Mock()
         with mock.patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}):
-            self.module.mark_restore_completed(7)
+            self.module.mark_restore_completed(sid)
             with (
                 mock.patch.object(
                     self.module, "acquire_operation_lock", return_value=lock_file
                 ),
-                mock.patch.object(self.module, "db_conn", return_value=connection),
-                mock.patch.object(
-                    self.module, "latest_session", return_value=(7, "periodic", "now")
-                ),
                 mock.patch.object(self.module, "hyprctl_json", return_value=None),
-                mock.patch.object(
-                    self.module,
-                    "load_windows",
-                ) as load_windows,
-                mock.patch.object(
-                    self.module, "load_workspace_layouts", return_value={}
-                ),
             ):
                 result = self.module.cmd_restore()
         self.assertEqual(75, result)
-        load_windows.assert_not_called()
 
     def test_dry_run_does_not_change_restore_marker(self):
-        connection = mock.Mock()
         lock_file = mock.Mock()
         row = window(1, 0, "terminal", 10)
+        self.record_snapshot("periodic", "complete", "", [row])
         with (
             mock.patch.dict(
                 os.environ,
@@ -4171,12 +4909,6 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(
                 self.module, "acquire_operation_lock", return_value=lock_file
             ),
-            mock.patch.object(self.module, "db_conn", return_value=connection),
-            mock.patch.object(
-                self.module, "latest_session", return_value=(1, "periodic", "now")
-            ),
-            mock.patch.object(self.module, "load_windows", return_value=[row]),
-            mock.patch.object(self.module, "load_workspace_layouts", return_value={}),
             mock.patch.object(self.module, "hyprctl_json", return_value=[]),
             mock.patch.object(self.module, "mark_restore_completed") as mark,
         ):
@@ -4184,8 +4916,8 @@ class OmarchySeshTests(unittest.TestCase):
         mark.assert_not_called()
 
     def test_empty_dry_run_does_not_change_restore_marker(self):
-        connection = mock.Mock()
         lock_file = mock.Mock()
+        self.record_snapshot("periodic", "complete", "", [])
         with (
             mock.patch.dict(
                 os.environ,
@@ -4195,11 +4927,6 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(
                 self.module, "acquire_operation_lock", return_value=lock_file
             ),
-            mock.patch.object(self.module, "db_conn", return_value=connection),
-            mock.patch.object(
-                self.module, "latest_session", return_value=(1, "periodic", "now")
-            ),
-            mock.patch.object(self.module, "load_windows", return_value=[]),
             mock.patch.object(self.module, "hyprctl_json", return_value=[]),
             mock.patch.object(self.module, "mark_restore_completed") as mark,
         ):
@@ -4207,10 +4934,12 @@ class OmarchySeshTests(unittest.TestCase):
         mark.assert_not_called()
 
     def test_application_failure_remains_nonretryable_after_gate_is_written(self):
-        self.module.persist_snapshot(
+        self.record_snapshot(
             "periodic", "complete", "", [window(1, 0, "terminal", 10)]
         )
         lock_file = mock.Mock()
+        prepared = mock.Mock()
+        prepared.execute.return_value = self.module.RestoreOutcome(0, 1, 0, False)
         with (
             mock.patch.dict(
                 os.environ,
@@ -4223,9 +4952,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "hyprctl_json", return_value=[]),
             mock.patch.object(self.module, "restore_was_completed", return_value=False),
             mock.patch.object(
-                self.module.PreparedRestore,
-                "execute",
-                return_value=self.module.RestoreOutcome(0, 1, 0, False),
+                self.module.RestoreRun, "prepare", return_value=prepared
             ),
             mock.patch.object(
                 self.module, "mark_restore_completed", return_value=True
@@ -4248,6 +4975,39 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log"),
         ):
             self.assertFalse(self.module.mark_restore_completed(1))
+
+    def test_current_session_name_round_trips_through_the_marker_file(self):
+        self.assertIsNone(self.module.read_current_session_name())
+
+        self.assertTrue(self.module.write_current_session_name("work"))
+        self.assertEqual("work", self.module.read_current_session_name())
+
+        self.assertTrue(self.module.write_current_session_name(None))
+        self.assertIsNone(self.module.read_current_session_name())
+
+    def test_current_session_name_ignores_a_corrupt_marker_file(self):
+        self.module.CURRENT_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.module.CURRENT_SESSION_PATH.write_text("not json")
+
+        self.assertIsNone(self.module.read_current_session_name())
+
+    def test_current_session_name_ignores_valid_json_with_the_wrong_shape(self):
+        self.module.CURRENT_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        for value in ("null", "[]", '"work"', "42"):
+            with self.subTest(value=value):
+                self.module.CURRENT_SESSION_PATH.write_text(value)
+                self.assertIsNone(self.module.read_current_session_name())
+
+    def test_current_session_name_write_failure_does_not_raise(self):
+        with (
+            mock.patch.object(
+                self.module.os, "replace", side_effect=OSError("disk full")
+            ),
+            mock.patch.object(self.module, "log") as write_log,
+        ):
+            self.assertFalse(self.module.write_current_session_name("work"))
+        write_log.assert_called_once()
+        self.assertIn("current session: failed to write marker", write_log.call_args.args[0])
 
     def test_autosave_sleeps_before_first_capture(self):
         with (
@@ -4412,6 +5172,36 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertEqual(0, self.module.cmd_mode())
         output.assert_called_once_with("manual")
 
+    def test_mode_json_reports_active_with_current_session_name(self):
+        results = [
+            mock.Mock(returncode=0, stdout="enabled\n"),
+            mock.Mock(returncode=0, stdout="active\n"),
+        ]
+        self.module.write_current_session_name("work")
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(self.module.subprocess, "run", side_effect=results),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, self.module.cmd_mode(as_json=True))
+        self.assertEqual(
+            {"mode": "active", "name": "work"},
+            self.module.json.loads(stdout.getvalue()),
+        )
+
+    def test_mode_json_reports_manual_with_no_current_session_name(self):
+        result = mock.Mock(returncode=1, stdout="disabled\n", stderr="")
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(self.module.subprocess, "run", return_value=result),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, self.module.cmd_mode(as_json=True))
+        self.assertEqual(
+            {"mode": "manual", "name": None},
+            self.module.json.loads(stdout.getvalue().strip()),
+        )
+
     def test_manual_mode_disables_autosave_now(self):
         result = mock.Mock(returncode=0)
         with mock.patch.object(
@@ -4459,6 +5249,88 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertEqual(0, self.module.cmd_mode("active"))
         save.assert_called_once_with("manual", wait=True)
 
+    def test_active_mode_json_suppresses_only_baseline_save_stdout(self):
+        result = mock.Mock(returncode=0)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def save_baseline(*_args, **_kwargs):
+            print("saved 2 windows")
+            print("baseline warning", file=sys.stderr)
+            return 0
+
+        with (
+            mock.patch.object(
+                self.module, "restore_is_ready", side_effect=[False, True]
+            ),
+            mock.patch.object(self.module, "cmd_save", side_effect=save_baseline),
+            mock.patch.object(self.module.subprocess, "run", return_value=result),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(0, self.module.cmd_mode("active", as_json=True))
+
+        self.assertEqual(
+            {"mode": "active", "name": None},
+            self.module.json.loads(stdout.getvalue()),
+        )
+        self.assertEqual("baseline warning\n", stderr.getvalue())
+
+    def test_manual_mode_json_emits_one_complete_document(self):
+        result = mock.Mock(returncode=0)
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(self.module.subprocess, "run", return_value=result),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, self.module.cmd_mode("manual", as_json=True))
+
+        self.assertEqual(
+            {"mode": "manual", "name": None},
+            self.module.json.loads(stdout.getvalue()),
+        )
+
+    def test_qml_sources_cover_the_panel_session_contract(self):
+        service = SERVICE.read_text()
+        panel = PANEL.read_text()
+
+        for command in (
+            'modeProcess.command = [binaryPath, "mode", "--json"]',
+            'modeProcess.command = [binaryPath, "mode", nextMode, "--json"]',
+            'listProcess.command = [binaryPath, "list", "--json"]',
+        ):
+            self.assertIn(command, service)
+        self.assertRegex(
+            service,
+            r"if \(exitCode !== 0\) \{\s+root\.modeKnown = false",
+        )
+        self.assertRegex(
+            service,
+            r'if \(value !== "active" && value !== "manual"\) \{\s+'
+            r"root\.modeKnown = false",
+        )
+        for contract in (
+            "Flipable {",
+            "service.listSessions()",
+            'tooltipText: "Restore session"',
+            "onClicked: root.chooseSession(index)",
+            'tooltipText: "Delete session"',
+            "onClicked: root.requestDelete(index)",
+            "ConfirmDialog {",
+            "onDeleteRequested:",
+            "else if (root.showingSessions) root.showOptions()",
+            '!root.modeKnown\n    ? "unavailable"',
+        ):
+            self.assertIn(contract, panel)
+
+    def test_sql_inspector_is_read_only_and_uses_explicit_aggregates(self):
+        sql = SQL_INSPECTOR.read_text().lower()
+        self.assertNotIn("select *", sql)
+        self.assertIn("count(distinct w.id) as window_count", sql)
+        self.assertIn("count(distinct wl.workspace_id) as layout_count", sql)
+        for mutation in ("insert ", "update ", "delete ", "drop ", "alter "):
+            self.assertNotIn(mutation, sql)
+
     def test_active_mode_stays_disabled_when_baseline_capture_fails(self):
         with (
             mock.patch.object(self.module, "restore_is_ready", return_value=False),
@@ -4490,7 +5362,7 @@ class OmarchySeshTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             home_path = Path(home)
             config_home = home_path / config_name
-            state_home = home_path / ".local" / "state"
+            state_home = home_path / "xdg-state"
             if permissive_state:
                 state_dir = state_home / "omarchy"
                 log_dir = state_dir / "log"
@@ -4499,6 +5371,8 @@ class OmarchySeshTests(unittest.TestCase):
                 log_dir.chmod(0o755)
                 (state_dir / "session.db").write_text("database")
                 (state_dir / "session.db").chmod(0o644)
+                (state_dir / "current-session.json").write_text('{"name": "work"}')
+                (state_dir / "current-session.json").chmod(0o644)
                 (log_dir / "omarchy-sesh.log").write_text("log")
                 (log_dir / "omarchy-sesh.log").chmod(0o644)
             unit_dir = config_home / "systemd" / "user"
@@ -4563,6 +5437,13 @@ class OmarchySeshTests(unittest.TestCase):
                         & 0o777
                         if (state_home / "omarchy" / "session.db").exists()
                         else None,
+                        "current_session": (
+                            state_home / "omarchy" / "current-session.json"
+                        ).stat().st_mode
+                        & 0o777,
+                        "current_session_content": (
+                            state_home / "omarchy" / "current-session.json"
+                        ).read_text(),
                         "log_file": (
                             state_home / "omarchy" / "log" / "omarchy-sesh.log"
                         ).stat().st_mode
@@ -4578,7 +5459,7 @@ class OmarchySeshTests(unittest.TestCase):
     def test_first_install_enables_autosave(self):
         calls, _, marker = self.run_installer(autosave_unit_exists=False)
         self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
-        self.assertEqual("0.2.7", marker)
+        self.assertEqual("0.2.8", marker)
 
     def test_installer_creates_owner_only_state(self):
         _, _, _, modes = self.run_installer(
@@ -4591,6 +5472,8 @@ class OmarchySeshTests(unittest.TestCase):
                 "install_marker": 0o600,
                 "menu_marker": 0o600,
                 "database": None,
+                "current_session": 0o600,
+                "current_session_content": "",
                 "log_file": None,
             },
             modes,
@@ -4605,6 +5488,8 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(0o700, modes["state"])
         self.assertEqual(0o700, modes["log"])
         self.assertEqual(0o600, modes["database"])
+        self.assertEqual(0o600, modes["current_session"])
+        self.assertEqual('{"name": "work"}', modes["current_session_content"])
         self.assertEqual(0o600, modes["log_file"])
 
     def test_reinstall_preserves_manual_mode(self):
@@ -4648,10 +5533,12 @@ class OmarchySeshTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         home = Path(temporary.name)
         config_home = home / "xdg-config"
-        state_home = home / ".local" / "state"
+        state_home = home / "xdg-state"
         journal = state_home / "omarchy" / "session.db-journal"
         journal.parent.mkdir(parents=True)
         journal.write_text("private")
+        current_session = state_home / "omarchy" / "current-session.json"
+        current_session.write_text('{"name": "work"}')
         binary = home / ".local" / "bin" / "omarchy-sesh"
         binary.parent.mkdir(parents=True)
         binary.symlink_to(home / "missing-binary")
@@ -4703,10 +5590,44 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertFalse((unit_dir / "omarchy-sesh.service").is_symlink())
             self.assertNotIn("omarchy-sesh", legacy_menu.read_text())
             self.assertFalse(
-                (Path(temporary.name) / ".local/state/omarchy/session.db-journal").exists()
+                (Path(temporary.name) / "xdg-state/omarchy/session.db-journal").exists()
+            )
+            self.assertFalse(
+                (Path(temporary.name) / "xdg-state/omarchy/current-session.json").exists()
             )
         finally:
             temporary.cleanup()
+
+    def test_uninstall_removes_otherwise_isolated_dangling_state_artifacts(self):
+        for relative in ("session.db", "current-session.json"):
+            with self.subTest(path=relative), tempfile.TemporaryDirectory() as home:
+                home_path = Path(home)
+                state_dir = home_path / "xdg-state" / "omarchy"
+                state_dir.mkdir(parents=True)
+                artifact = state_dir / relative
+                artifact.symlink_to(home_path / "missing-target")
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "HOME": home,
+                        "XDG_CONFIG_HOME": str(home_path / "xdg-config"),
+                        "XDG_STATE_HOME": str(home_path / "xdg-state"),
+                        "SYSTEMCTL": "/bin/true",
+                    }
+                )
+
+                result = subprocess.run(
+                    ["bash", str(UNINSTALLER)],
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    check=False,
+                )
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertFalse(artifact.is_symlink())
+                artifact.write_text("reinstall replacement")
+                self.assertEqual("reinstall replacement", artifact.read_text())
 
     def test_uninstall_aborts_when_service_state_cannot_be_verified(self):
         temporary, result, binary, _, _ = self.run_uninstaller(
@@ -4720,12 +5641,141 @@ class OmarchySeshTests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_uninstall_refuses_a_symlinked_state_directory_without_following_it(self):
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            state_home = home_path / "xdg-state"
+            state_home.mkdir()
+            external = home_path / "external"
+            external.mkdir()
+            protected = external / "session.db"
+            protected.write_text("keep")
+            (state_home / "omarchy").symlink_to(external, target_is_directory=True)
+            fake_systemctl = home_path / "systemctl"
+            fake_systemctl.write_text("#!/bin/sh\nexit 0\n")
+            fake_systemctl.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": home,
+                    "XDG_CONFIG_HOME": str(home_path / "xdg-config"),
+                    "XDG_STATE_HOME": str(state_home),
+                    "SYSTEMCTL": str(fake_systemctl),
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(UNINSTALLER)],
+                capture_output=True,
+                text=True,
+                env=environment,
+                check=False,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("unsafe cleanup directory (symlink)", result.stderr)
+            self.assertEqual("keep", protected.read_text())
+            self.assertTrue((state_home / "omarchy").is_symlink())
+
+    def test_uninstall_refuses_a_dangling_state_directory_symlink(self):
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            state_home = home_path / "xdg-state"
+            state_home.mkdir()
+            (state_home / "omarchy").symlink_to(home_path / "missing")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": home,
+                    "XDG_CONFIG_HOME": str(home_path / "xdg-config"),
+                    "XDG_STATE_HOME": str(state_home),
+                    "SYSTEMCTL": "/bin/true",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(UNINSTALLER)],
+                capture_output=True,
+                text=True,
+                env=environment,
+                check=False,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("unsafe cleanup directory (symlink)", result.stderr)
+
+    def test_uninstall_refuses_non_directory_state_and_log_paths(self):
+        for unsafe_path in ("omarchy", "omarchy/log"):
+            with self.subTest(path=unsafe_path), tempfile.TemporaryDirectory() as home:
+                home_path = Path(home)
+                state_home = home_path / "xdg-state"
+                path = state_home / unsafe_path
+                path.parent.mkdir(parents=True)
+                path.write_text("not a directory")
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "HOME": home,
+                        "XDG_CONFIG_HOME": str(home_path / "xdg-config"),
+                        "XDG_STATE_HOME": str(state_home),
+                        "SYSTEMCTL": "/bin/true",
+                    }
+                )
+
+                result = subprocess.run(
+                    ["bash", str(UNINSTALLER)],
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    check=False,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("unsafe cleanup directory (not a directory)", result.stderr)
+                self.assertEqual("not a directory", path.read_text())
+
+    def test_uninstall_refuses_a_symlinked_log_directory_without_following_it(self):
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            state_home = home_path / "xdg-state"
+            state_dir = state_home / "omarchy"
+            state_dir.mkdir(parents=True)
+            external = home_path / "external-log"
+            external.mkdir()
+            protected = external / "omarchy-sesh.log"
+            protected.write_text("keep")
+            (state_dir / "log").symlink_to(external, target_is_directory=True)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": home,
+                    "XDG_CONFIG_HOME": str(home_path / "xdg-config"),
+                    "XDG_STATE_HOME": str(state_home),
+                    "SYSTEMCTL": "/bin/true",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(UNINSTALLER)],
+                capture_output=True,
+                text=True,
+                env=environment,
+                check=False,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("unsafe cleanup directory (symlink)", result.stderr)
+            self.assertEqual("keep", protected.read_text())
+
     def test_acceptance_reports_matching_power_menu_restore(self):
         temporary = tempfile.TemporaryDirectory()
         try:
             module = load_module(temporary.name)
             row = window(1, 0, "terminal", 10, title="acceptance")
-            sid = module.persist_snapshot("logout", "complete", "", [row])
+            sid = module.SnapshotHistory(module.DB_PATH).record(
+                module.SnapshotCapture("logout", "complete", "", [row], ()),
+                retention=5,
+            )
             module.RESTORE_MARKER_PATH.write_text(
                 f'{{"session": {sid}, "instance": "instance-1", "complete": true}}'
             )
@@ -4753,7 +5803,10 @@ class OmarchySeshTests(unittest.TestCase):
         try:
             module = load_module(temporary.name)
             row = window(1, 0, "terminal", 10)
-            sid = module.persist_snapshot("logout", "complete", "", [row])
+            sid = module.SnapshotHistory(module.DB_PATH).record(
+                module.SnapshotCapture("logout", "complete", "", [row], ()),
+                retention=5,
+            )
             module.RESTORE_MARKER_PATH.write_text(
                 f'{{"session": {sid}, "instance": "instance-1", "complete": false}}'
             )

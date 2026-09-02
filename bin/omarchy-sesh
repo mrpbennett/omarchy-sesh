@@ -2,7 +2,9 @@
 
 import argparse
 import contextlib
+import errno
 import fcntl
+import io
 import json
 import math
 import os
@@ -15,9 +17,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from types import MappingProxyType
+from typing import ClassVar
 
 STATE_DIR = (
     Path(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"))
@@ -33,6 +38,7 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = STATE_DIR / "log" / "omarchy-sesh.log"
 LOCK_PATH = STATE_DIR / "session.lock"
 RESTORE_MARKER_PATH = STATE_DIR / "restore-complete.json"
+CURRENT_SESSION_PATH = STATE_DIR / "current-session.json"
 AUTOSAVE_UNIT = "omarchy-sesh-autosave.service"
 
 DEFAULT_CONFIG = {
@@ -67,17 +73,150 @@ class NamedSessionConflict(ValueError):
     pass
 
 
+class SnapshotHistoryError(RuntimeError):
+    def __init__(self, message, *, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+@dataclass(frozen=True)
+class SnapshotWindow(Mapping):
+    """One selected window keyed by its snapshot-local capture order.
+
+    Mapping access keeps the substantial restore algorithms generic. Their
+    internal ``row["id"]`` key resolves to ``ord`` and never to a SQLite key.
+    """
+
+    ord: int
+    window_class: str
+    initial_class: str | None
+    title: str | None
+    initial_title: str | None
+    cmdline: str
+    cwd: str | None
+    workspace_id: int | None
+    workspace_name: str | None
+    monitor_name: str | None
+    monitor_description: str | None
+    at_x: int | None
+    at_y: int | None
+    size_w: int | None
+    size_h: int | None
+    floating: int
+    fullscreen: int
+    pinned: int
+    xwayland: int
+    pid: int | None
+    group_id: int | None
+    group_ord: int | None
+
+    _KEYS: ClassVar[tuple[str, ...]] = (
+        "id",
+        "ord",
+        "class",
+        "initial_class",
+        "title",
+        "initial_title",
+        "cmdline",
+        "cwd",
+        "workspace_id",
+        "workspace_name",
+        "monitor_name",
+        "monitor_description",
+        "at_x",
+        "at_y",
+        "size_w",
+        "size_h",
+        "floating",
+        "fullscreen",
+        "pinned",
+        "xwayland",
+        "pid",
+        "group_id",
+        "group_ord",
+    )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "SnapshotWindow":
+        """Normalize captured or scenario data using snapshot-local ``ord``."""
+        if not isinstance(value, Mapping):
+            raise TypeError("snapshot window must be a mapping")
+        for field in ("ord", "class", "cmdline"):
+            if field not in value:
+                raise ValueError(f"snapshot window is missing required field {field!r}")
+        ord_value = value["ord"]
+        if type(ord_value) is not int or ord_value < 0:
+            raise ValueError("snapshot window ord must be a non-negative integer")
+        window_class = value["class"]
+        if not isinstance(window_class, str) or not window_class:
+            raise ValueError("snapshot window class must be a non-empty string")
+        cmdline = value["cmdline"]
+        if not isinstance(cmdline, str) or not cmdline:
+            raise ValueError("snapshot window cmdline must be a non-empty string")
+        return cls(
+            ord=ord_value,
+            window_class=window_class,
+            initial_class=value.get("initial_class"),
+            title=value.get("title"),
+            initial_title=value.get("initial_title"),
+            cmdline=cmdline,
+            cwd=value.get("cwd"),
+            workspace_id=value.get("workspace_id"),
+            workspace_name=value.get("workspace_name"),
+            monitor_name=value.get("monitor_name"),
+            monitor_description=value.get("monitor_description"),
+            at_x=value.get("at_x"),
+            at_y=value.get("at_y"),
+            size_w=value.get("size_w"),
+            size_h=value.get("size_h"),
+            floating=value.get("floating", 0),
+            fullscreen=value.get("fullscreen", 0),
+            pinned=value.get("pinned", 0),
+            xwayland=value.get("xwayland", 0),
+            pid=value.get("pid"),
+            group_id=value.get("group_id"),
+            group_ord=value.get("group_ord"),
+        )
+
+    @property
+    def identity(self) -> int:
+        return self.ord
+
+    def __getitem__(self, key: str) -> object:
+        if key == "id":
+            return self.identity
+        if key == "class":
+            return self.window_class
+        if key in self._KEYS:
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._KEYS)
+
+    def __len__(self) -> int:
+        return len(self._KEYS)
+
+
 @dataclass(frozen=True)
 class Snapshot:
     session_id: int
-    windows: tuple
-    workspace_layouts: object
+    windows: tuple[SnapshotWindow, ...]
+    workspace_layouts: Mapping[int, Mapping[str, object]]
+    label: str | None = None
+    created_at: str | None = None
+    capture_status: str = "complete"
+    capture_error: str | None = None
 
     def __post_init__(self):
+        windows = tuple(SnapshotWindow.from_mapping(row) for row in self.windows)
+        identities = [window.identity for window in windows]
+        if len(identities) != len(set(identities)):
+            raise ValueError("snapshot window ord values must be unique")
         object.__setattr__(
             self,
             "windows",
-            tuple(MappingProxyType(dict(row)) for row in self.windows),
+            windows,
         )
         object.__setattr__(
             self,
@@ -89,6 +228,47 @@ class Snapshot:
                 }
             ),
         )
+
+
+@dataclass(frozen=True)
+class SnapshotCapture:
+    label: str
+    status: str
+    error: str
+    windows: tuple[Mapping[str, object], ...]
+    workspace_layouts: tuple[Mapping[str, object], ...]
+    name: str | None = None
+
+    def __post_init__(self):
+        for field in ("label", "status", "error"):
+            value = getattr(self, field)
+            if not isinstance(value, str):
+                raise TypeError(f"{field} must be a string")
+        if self.name is not None and not isinstance(self.name, str):
+            raise TypeError("name must be a string or None")
+        object.__setattr__(
+            self,
+            "windows",
+            tuple(MappingProxyType(dict(row)) for row in self.windows),
+        )
+        object.__setattr__(
+            self,
+            "workspace_layouts",
+            tuple(
+                MappingProxyType(dict(layout)) for layout in self.workspace_layouts
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class SnapshotSummary:
+    session_id: int
+    label: str | None
+    created_at: str
+    window_count: int
+    capture_status: str
+    name: str | None = None
+
 
 @dataclass(frozen=True)
 class RestoreSettings:
@@ -114,35 +294,616 @@ class RestoreSettings:
             raise ValueError("invalid monitor fallback")
 
 
-class HyprlandRestoreAdapter:
-    """Primitive Hyprland operations used by a Restore run."""
+class ObservationKind(Enum):
+    WINDOWS = auto()
+    DISPLAYS = auto()
+    WORKSPACES = auto()
+    WORKSPACE_RULES = auto()
+    OUTER_GAPS = auto()
+    INNER_GAPS = auto()
+    VERSION = auto()
+    ANIMATIONS = auto()
+    FOCUS = auto()
+    FOCUSED_WINDOW = auto()
+    FOCUSED_WORKSPACE = auto()
+    TREE_REPLAY_SETTINGS = auto()
+
+
+class ObservationStatus(Enum):
+    AVAILABLE = auto()
+    UNAVAILABLE = auto()
+
+
+class MutationStatus(Enum):
+    APPLIED = auto()
+    UNCHANGED = auto()
+    REJECTED = auto()
+    UNAVAILABLE = auto()
+
+
+def _freeze(value):
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True)
+class HyprlandCapture:
+    windows: tuple
+    displays: tuple
+    workspaces: tuple
+    outer_gaps: object
+    inner_gaps: object
+    workspace_rules: tuple
+
+    def __post_init__(self):
+        for field in ("windows", "displays", "workspaces", "workspace_rules"):
+            object.__setattr__(self, field, _freeze(getattr(self, field)))
+        object.__setattr__(self, "outer_gaps", _freeze(self.outer_gaps))
+        object.__setattr__(self, "inner_gaps", _freeze(self.inner_gaps))
+
+
+@dataclass(frozen=True)
+class CaptureResult:
+    status: ObservationStatus
+    capture: HyprlandCapture | None = None
+
+
+@dataclass(frozen=True)
+class ObservationResult:
+    status: ObservationStatus
+    value: object = None
+
+    def __post_init__(self):
+        if self.status is ObservationStatus.AVAILABLE:
+            if self.value is None:
+                raise ValueError("available observation requires a value")
+            object.__setattr__(self, "value", _freeze(self.value))
+        elif self.value is not None:
+            raise ValueError("unavailable observation cannot carry a value")
+
+
+def _require_text(value, field):
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a non-empty string")
+
+
+@dataclass(frozen=True)
+class SetAnimations:
+    enabled: bool
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise TypeError("enabled must be a bool")
+
+
+@dataclass(frozen=True)
+class PlaceWindow:
+    window: object
+    address: str
+    current: object | None = None
+
+    def __post_init__(self):
+        _require_text(self.address, "address")
+        object.__setattr__(self, "window", _freeze(self.window))
+        object.__setattr__(self, "current", _freeze(self.current))
+
+
+@dataclass(frozen=True)
+class MoveWindowToWorkspace:
+    address: str
+    workspace_id: int
+
+    def __post_init__(self):
+        _require_text(self.address, "address")
+
+
+@dataclass(frozen=True)
+class MoveWorkspaceToDisplay:
+    workspace_id: int
+    display: str
+
+    def __post_init__(self):
+        _require_text(self.display, "display")
+
+
+@dataclass(frozen=True)
+class LaunchApplication:
+    command: str
+    workspace_id: int | None
+    floating: bool
+
+    def __post_init__(self):
+        _require_text(self.command, "command")
+        if type(self.floating) is not bool:
+            raise TypeError("floating must be a bool")
+
+
+@dataclass(frozen=True)
+class SwapWindows:
+    address: str
+    target: str
+
+    def __post_init__(self):
+        _require_text(self.address, "address")
+        _require_text(self.target, "target")
+
+
+@dataclass(frozen=True)
+class ResizeWindow:
+    address: str
+    width: int
+    height: int
+
+    def __post_init__(self):
+        _require_text(self.address, "address")
+
+
+@dataclass(frozen=True)
+class FocusWindow:
+    address: str
+
+    def __post_init__(self):
+        _require_text(self.address, "address")
+
+
+@dataclass(frozen=True)
+class FocusWorkspace:
+    workspace_id: int
+
+
+@dataclass(frozen=True)
+class FocusDisplay:
+    display: str
+
+    def __post_init__(self):
+        _require_text(self.display, "display")
+
+
+@dataclass(frozen=True)
+class ToggleSpecialWorkspace:
+    name: str
+
+    def __post_init__(self):
+        _require_text(self.name, "name")
+
+
+@dataclass(frozen=True)
+class ReplayWorkspaceTree:
+    workspace_id: int
+    rows: tuple
+    matches: object
+    tree: tuple
+    focus: object
+    stage_id: str
+
+    def __post_init__(self):
+        _require_text(self.stage_id, "stage_id")
+        for field in ("rows", "matches", "tree", "focus"):
+            object.__setattr__(self, field, _freeze(getattr(self, field)))
+
+
+@dataclass(frozen=True)
+class RestoreWindowGroup:
+    addresses: tuple
+
+    def __post_init__(self):
+        addresses = tuple(self.addresses)
+        if not addresses:
+            raise ValueError("addresses must not be empty")
+        for address in addresses:
+            _require_text(address, "address")
+        object.__setattr__(self, "addresses", addresses)
+
+
+@dataclass(frozen=True)
+class MutationResult:
+    status: MutationStatus
+
+    @property
+    def succeeded(self):
+        return self.status in (MutationStatus.APPLIED, MutationStatus.UNCHANGED)
+
+
+@dataclass(frozen=True)
+class WorkspaceMoveResult:
+    status: MutationStatus
+    refreshed_windows: tuple | None = None
+
+    def __post_init__(self):
+        if self.status is MutationStatus.APPLIED:
+            if self.refreshed_windows is None:
+                raise ValueError("applied workspace move requires refreshed windows")
+            object.__setattr__(self, "refreshed_windows", _freeze(self.refreshed_windows))
+        elif self.refreshed_windows is not None:
+            raise ValueError("non-applied workspace move cannot carry refreshed windows")
+
+    @property
+    def succeeded(self):
+        return self.status in (MutationStatus.APPLIED, MutationStatus.UNCHANGED)
+
+
+def observed(compositor, kind):
+    result = compositor.observe(kind)
+    if result.status is ObservationStatus.UNAVAILABLE:
+        return None
+    return result.value
+
+
+class ProductionHyprland:
+    """Translate semantic desktop operations to Hyprland IPC."""
 
     def __init__(self, write_log=None):
         self.write_log = write_log
 
-    def query_json(self, *args):
+    def _query(self, *args):
         if self.write_log is None:
             return hyprctl_json(*args)
         return hyprctl_json(*args, write_log=self.write_log)
 
-    def query_batch_json(self, *commands):
-        if self.write_log is None:
-            return hyprctl_batch_json(*commands)
-        return hyprctl_batch_json(*commands, write_log=self.write_log)
-
-    def dispatch(self, lua, failure_context=None):
-        if self.write_log is None:
-            if failure_context is None:
-                return dispatch(lua)
-            return dispatch(lua, failure_context=failure_context)
-        return dispatch(
-            lua, failure_context=failure_context, write_log=self.write_log
+    def capture(self):
+        values = (
+            self._query("clients"),
+            self._query("monitors"),
+            self._query("workspaces"),
+            self._query("getoption", "general:gaps_out"),
+            self._query("getoption", "general:gaps_in"),
+            self._query("workspacerules"),
+        )
+        if any(value is None for value in values):
+            return CaptureResult(ObservationStatus.UNAVAILABLE)
+        return CaptureResult(
+            ObservationStatus.AVAILABLE,
+            HyprlandCapture(*values),
         )
 
-    def evaluate(self, lua):
-        if self.write_log is None:
-            return eval_lua(lua)
-        return eval_lua(lua, write_log=self.write_log)
+    def observe(self, kind):
+        if kind is ObservationKind.FOCUS:
+            values = (
+                self._query("activewindow"),
+                self._query("activeworkspace"),
+                self._query("monitors"),
+            )
+            value = None if any(item is None for item in values) else values
+        elif kind is ObservationKind.FOCUSED_WINDOW:
+            value = self._query("activewindow")
+        elif kind is ObservationKind.FOCUSED_WORKSPACE:
+            value = self._query("activeworkspace")
+        elif kind is ObservationKind.TREE_REPLAY_SETTINGS:
+            commands = (
+                "getoption dwindle:use_active_for_splits",
+                "getoption dwindle:preserve_split",
+                "getoption dwindle:permanent_direction_override",
+            )
+            if self.write_log is None:
+                value = hyprctl_batch_json(*commands)
+            else:
+                value = hyprctl_batch_json(*commands, write_log=self.write_log)
+        else:
+            endpoint = {
+                ObservationKind.WINDOWS: ("clients",),
+                ObservationKind.DISPLAYS: ("monitors",),
+                ObservationKind.WORKSPACES: ("workspaces",),
+                ObservationKind.WORKSPACE_RULES: ("workspacerules",),
+                ObservationKind.OUTER_GAPS: ("getoption", "general:gaps_out"),
+                ObservationKind.INNER_GAPS: ("getoption", "general:gaps_in"),
+                ObservationKind.VERSION: ("version",),
+                ObservationKind.ANIMATIONS: ("getoption", "animations:enabled"),
+            }[kind]
+            value = self._query(*endpoint)
+        if value is None:
+            return ObservationResult(ObservationStatus.UNAVAILABLE)
+        return ObservationResult(ObservationStatus.AVAILABLE, value)
+
+    @contextlib.contextmanager
+    def mutations(self):
+        previous = animations_enabled(compositor=self)
+        suppressed = False
+        if previous:
+            suppressed = set_animations_enabled(False, compositor=self)
+        try:
+            yield self
+        finally:
+            if suppressed and not set_animations_enabled(True, compositor=self):
+                (log if self.write_log is None else self.write_log)(
+                    "restore: could not re-enable animations; run 'hyprctl reload'"
+                )
+
+    def apply(self, action):
+        lua, unchanged, failure_context = _production_action(action)
+        if unchanged:
+            return MutationResult(MutationStatus.UNCHANGED)
+        dispatch_action = isinstance(
+            action,
+            (
+                LaunchApplication,
+                MoveWindowToWorkspace,
+                MoveWorkspaceToDisplay,
+                SwapWindows,
+                ResizeWindow,
+                FocusWindow,
+                FocusWorkspace,
+                FocusDisplay,
+                ToggleSpecialWorkspace,
+            ),
+        )
+        if dispatch_action:
+            if self.write_log is None:
+                result = (
+                    dispatch(lua)
+                    if failure_context is None
+                    else dispatch(lua, failure_context=failure_context)
+                )
+            else:
+                result = dispatch(
+                    lua, failure_context=failure_context, write_log=self.write_log
+                )
+        else:
+            if self.write_log is None:
+                result = eval_lua(lua)
+            else:
+                result = eval_lua(lua, write_log=self.write_log)
+        status = (
+            MutationStatus.UNAVAILABLE
+            if result is None
+            else MutationStatus.APPLIED
+            if result
+            else MutationStatus.REJECTED
+        )
+        if isinstance(action, MoveWorkspaceToDisplay):
+            if status is not MutationStatus.APPLIED:
+                return WorkspaceMoveResult(status)
+            refreshed = self.observe(ObservationKind.WINDOWS)
+            if refreshed.status is ObservationStatus.UNAVAILABLE:
+                return WorkspaceMoveResult(MutationStatus.UNAVAILABLE)
+            return WorkspaceMoveResult(
+                MutationStatus.APPLIED, refreshed.value
+            )
+        return MutationResult(status)
+
+
+class DeterministicHyprland:
+    """Small stateful Hyprland model for Restore run scenarios."""
+
+    def __init__(
+        self,
+        *,
+        clients=(),
+        monitors=(),
+        workspaces=(),
+        focus=None,
+        appearances=(),
+        launch_appearances=None,
+        window_observations=(),
+        observation_results=None,
+        action_results=None,
+    ):
+        self._clients = [dict(client) for client in clients]
+        self._monitors = [dict(monitor) for monitor in monitors]
+        self._workspaces = [dict(workspace) for workspace in workspaces]
+        self._focus = dict(focus or {})
+        self._appearances = [tuple(dict(client) for client in batch) for batch in appearances]
+        self._launch_appearances = {
+            count: tuple(dict(client) for client in batch)
+            for count, batch in (launch_appearances or {}).items()
+        }
+        self._pending_appearances = []
+        self._window_observations = list(window_observations)
+        self._observation_results = {
+            kind: list(queue) for kind, queue in (observation_results or {}).items()
+        }
+        self._action_results = {
+            action_type: list(queue)
+            for action_type, queue in (action_results or {}).items()
+        }
+        self.events = []
+        self.animations = True
+        self._window_observation_count = 0
+        self._successful_launches = 0
+
+    @property
+    def windows(self):
+        return _freeze(self._clients)
+
+    @property
+    def displays(self):
+        return _freeze(self._monitors)
+
+    @property
+    def workspace_state(self):
+        return _freeze(self._workspaces)
+
+    @property
+    def focus_state(self):
+        return _freeze(self._focus)
+
+    def capture(self):
+        self.events.append(("capture",))
+        return CaptureResult(
+            ObservationStatus.AVAILABLE,
+            HyprlandCapture(
+                self._clients, self._monitors, self._workspaces, {}, {}, ()
+            ),
+        )
+
+    def observe(self, kind):
+        self.events.append(("observe", kind))
+        if kind is ObservationKind.WINDOWS and self._window_observations:
+            configured = self._window_observations.pop(0)
+        else:
+            queue = self._observation_results.get(kind, ())
+            configured = queue.pop(0) if queue else None
+        if configured is not None:
+            if not isinstance(configured, ObservationResult):
+                if kind is ObservationKind.WINDOWS:
+                    self._clients = [dict(client) for client in configured]
+                configured = ObservationResult(
+                    ObservationStatus.AVAILABLE, configured
+                )
+            return configured
+        if kind is ObservationKind.WINDOWS:
+            if self._window_observation_count and self._appearances:
+                self._clients.extend(self._appearances.pop(0))
+            if self._pending_appearances:
+                self._clients.extend(self._pending_appearances)
+                self._pending_appearances = []
+            self._window_observation_count += 1
+            value = self._clients
+        elif kind is ObservationKind.DISPLAYS:
+            value = self._monitors
+        elif kind is ObservationKind.WORKSPACES:
+            value = self._workspaces
+        elif kind is ObservationKind.FOCUS:
+            value = (
+                self._focus.get("window", {}),
+                self._focus.get("workspace", {}),
+                self._monitors,
+            )
+        elif kind is ObservationKind.FOCUSED_WINDOW:
+            value = self._focus.get("window", {})
+        elif kind is ObservationKind.FOCUSED_WORKSPACE:
+            value = self._focus.get("workspace", {})
+        elif kind is ObservationKind.ANIMATIONS:
+            value = {"bool": self.animations}
+        elif kind is ObservationKind.VERSION:
+            value = {"version": "0.56.0"}
+        elif kind is ObservationKind.TREE_REPLAY_SETTINGS:
+            value = ({"bool": True}, {"bool": True}, {"bool": False})
+        elif kind in (ObservationKind.OUTER_GAPS, ObservationKind.INNER_GAPS):
+            value = {"css": "0"}
+        else:
+            value = ()
+        return ObservationResult(ObservationStatus.AVAILABLE, value)
+
+    @contextlib.contextmanager
+    def mutations(self):
+        self.events.append(("mutations", "begin"))
+        previous = self.animations
+        self.animations = False
+        try:
+            yield self
+        finally:
+            self.animations = previous
+            self.events.append(("mutations", "end"))
+
+    def apply(self, action):
+        self.events.append(("action", action))
+        queue = self._action_results.get(type(action), ())
+        configured = queue.pop(0) if queue else None
+        if configured is not None:
+            status = configured.status if hasattr(configured, "status") else configured
+            if status is not MutationStatus.APPLIED:
+                if isinstance(action, MoveWorkspaceToDisplay):
+                    return WorkspaceMoveResult(status)
+                return MutationResult(status)
+        if isinstance(action, SetAnimations):
+            enabled = action.enabled
+            if self.animations == enabled:
+                return MutationResult(MutationStatus.UNCHANGED)
+            self.animations = enabled
+        elif isinstance(action, PlaceWindow):
+            client = self._client(action.address)
+            if client is None:
+                return MutationResult(MutationStatus.REJECTED)
+            window = action.window
+            if window.get("workspace_id") is not None:
+                client["workspace"] = {"id": window["workspace_id"]}
+            client["floating"] = bool(window.get("floating"))
+            if window.get("floating") and saved_geometry(window) is not None:
+                client["at"] = [window["at_x"], window["at_y"]]
+                client["size"] = [window["size_w"], window["size_h"]]
+            client["fullscreen"] = window.get("fullscreen", 0)
+            client["fullscreenClient"] = window.get("fullscreen", 0)
+            client["pinned"] = bool(window.get("pinned"))
+        elif isinstance(action, MoveWindowToWorkspace):
+            client = self._client(action.address)
+            if client is None:
+                return MutationResult(MutationStatus.REJECTED)
+            client["workspace"] = {"id": action.workspace_id}
+        elif isinstance(action, MoveWorkspaceToDisplay):
+            workspace = next(
+                (
+                    item
+                    for item in self._workspaces
+                    if item.get("id") == action.workspace_id
+                ),
+                None,
+            )
+            if workspace is None:
+                return WorkspaceMoveResult(MutationStatus.REJECTED)
+            workspace["monitor"] = action.display
+        elif isinstance(action, SwapWindows):
+            first = self._client(action.address)
+            second = self._client(action.target)
+            if first is None or second is None:
+                return MutationResult(MutationStatus.REJECTED)
+            for field in ("at", "size"):
+                first[field], second[field] = second.get(field), first.get(field)
+        elif isinstance(action, ResizeWindow):
+            client = self._client(action.address)
+            if client is None:
+                return MutationResult(MutationStatus.REJECTED)
+            client["size"] = [action.width, action.height]
+        elif isinstance(action, FocusWindow):
+            self._focus["window"] = {"address": action.address}
+        elif isinstance(action, FocusWorkspace):
+            self._focus["workspace"] = {"id": action.workspace_id}
+        elif isinstance(action, FocusDisplay):
+            for monitor in self._monitors:
+                monitor["focused"] = monitor.get("name") == action.display
+        elif isinstance(action, ToggleSpecialWorkspace):
+            focused = next(
+                (monitor for monitor in self._monitors if monitor.get("focused")), None
+            )
+            if focused is None:
+                return MutationResult(MutationStatus.REJECTED)
+            focused["specialWorkspace"] = {
+                "id": -1,
+                "name": "special:" + action.name,
+            }
+        elif isinstance(action, ReplayWorkspaceTree):
+            replay_clients = []
+            for row in action.rows:
+                address = action.matches.get(row["id"])
+                client = self._client(address)
+                geometry = saved_geometry(row)
+                if client is None or geometry is None:
+                    return MutationResult(MutationStatus.REJECTED)
+                replay_clients.append((client, geometry))
+            for client, geometry in replay_clients:
+                client["workspace"] = {"id": action.workspace_id}
+                client["at"] = [geometry[0], geometry[1]]
+                client["size"] = [geometry[2], geometry[3]]
+        elif isinstance(action, RestoreWindowGroup):
+            addresses = action.addresses
+            if any(self._client(address) is None for address in addresses):
+                return MutationResult(MutationStatus.REJECTED)
+            for address in addresses:
+                self._client(address)["grouped"] = list(addresses)
+        elif not isinstance(action, LaunchApplication):
+            raise TypeError(f"unsupported Hyprland action: {type(action).__name__}")
+        result = MutationResult(MutationStatus.APPLIED)
+        if isinstance(action, LaunchApplication) and result.succeeded:
+            self._successful_launches += 1
+            self._pending_appearances.extend(
+                self._launch_appearances.get(self._successful_launches, ())
+            )
+        if isinstance(action, MoveWorkspaceToDisplay):
+            refreshed = self.observe(ObservationKind.WINDOWS)
+            if refreshed.status is ObservationStatus.UNAVAILABLE:
+                return WorkspaceMoveResult(MutationStatus.UNAVAILABLE)
+            return WorkspaceMoveResult(
+                MutationStatus.APPLIED, refreshed.value
+            )
+        return result
+
+    def _client(self, address):
+        return next(
+            (client for client in self._clients if client.get("address") == address),
+            None,
+        )
 
 
 class SystemClockAdapter:
@@ -151,6 +912,20 @@ class SystemClockAdapter:
 
     def sleep(self, seconds):
         time.sleep(seconds)
+
+
+class DeterministicClock:
+    def __init__(self, now=0.0):
+        self.now = now
+        self.events = []
+
+    def monotonic(self):
+        self.events.append(("monotonic", self.now))
+        return self.now
+
+    def sleep(self, seconds):
+        self.events.append(("sleep", seconds))
+        self.now += seconds
 
 
 def private_directory(path):
@@ -181,6 +956,7 @@ def secure_state_storage():
         DB_PATH.with_name(f"{DB_PATH.name}-journal"),
         LOCK_PATH,
         RESTORE_MARKER_PATH,
+        CURRENT_SESSION_PATH,
         LOG_PATH,
         STATE_DIR / "sesh-installed",
         STATE_DIR / "sesh-menu-created",
@@ -254,6 +1030,12 @@ def hyprctl_batch_json(*commands, write_log=None):
 
 
 def dispatch(lua, failure_context=None, *, write_log=None):
+    return _dispatch_lua(
+        lua, failure_context=failure_context, write_log=write_log
+    )
+
+
+def _dispatch_lua(lua, failure_context=None, *, write_log=None):
     write_log = log if write_log is None else write_log
     out = subprocess.run(
         ["hyprctl", "dispatch", lua], capture_output=True, text=True, check=False
@@ -268,14 +1050,19 @@ def dispatch(lua, failure_context=None, *, write_log=None):
             )
         else:
             write_log(f"dispatch failed ({lua}): {output}")
+        if out.returncode < 0 or 1 <= out.returncode <= 6:
+            return None
         return False
     return True
 
 
 def animations_enabled(*, compositor=None):
-    compositor = compositor or HyprlandRestoreAdapter()
-    option = compositor.query_json("getoption", "animations:enabled")
-    if not isinstance(option, dict):
+    compositor = compositor or ProductionHyprland()
+    return _animation_value(observed(compositor, ObservationKind.ANIMATIONS))
+
+
+def _animation_value(option):
+    if not isinstance(option, Mapping):
         return None
     value = option.get("int", option.get("bool"))
     return None if value is None else bool(value)
@@ -289,15 +1076,8 @@ def set_animations_enabled(enabled, *, compositor=None):
     so the write must go through `hl.config` and be read back to confirm it
     actually landed.
     """
-    compositor = compositor or HyprlandRestoreAdapter()
-    value = "true" if enabled else "false"
-    return bool(
-        compositor.evaluate(
-            f"hl.config({{ animations = {{ enabled = {value} }} }}) "
-            f"if hl.get_config('animations:enabled') ~= {value} then "
-            "error('animations:enabled did not change') end"
-        )
-    )
+    compositor = compositor or ProductionHyprland()
+    return compositor.apply(SetAnimations(enabled)).succeeded
 
 
 @contextlib.contextmanager
@@ -310,23 +1090,16 @@ def animations_disabled(*, compositor=None, write_log=None):
     cannot be read or cleared the restore proceeds with animations on rather
     than failing, and the previous value is always put back.
     """
-    compositor = compositor or HyprlandRestoreAdapter()
-    write_log = log if write_log is None else write_log
-    previous = animations_enabled(compositor=compositor)
-    suppressed = bool(previous) and set_animations_enabled(
-        False, compositor=compositor
-    )
-    try:
+    compositor = compositor or ProductionHyprland(write_log=write_log)
+    with compositor.mutations():
         yield
-    finally:
-        restored = not suppressed or set_animations_enabled(
-            True, compositor=compositor
-        )
-        if not restored:
-            write_log("restore: could not re-enable animations; run 'hyprctl reload'")
 
 
 def eval_lua(lua, *, write_log=None):
+    return _eval_lua_result(lua, write_log=write_log)
+
+
+def _eval_lua_result(lua, *, write_log=None):
     write_log = log if write_log is None else write_log
     out = subprocess.run(
         ["hyprctl", "eval", lua], capture_output=True, text=True, check=False
@@ -472,6 +1245,7 @@ def migrate_empty_xdg_paths():
             "session.db-journal",
             "session.lock",
             "restore-complete.json",
+            "current-session.json",
             "sesh-installed",
             "sesh-menu-created",
             "log/omarchy-sesh.log",
@@ -485,130 +1259,474 @@ def migrate_empty_xdg_paths():
         secure_state_storage()
 
 
-def db_conn():
-    secure_state_storage()
-    conn = sqlite3.connect(DB_PATH, timeout=5)
-    private_file(DB_PATH)
-    conn.execute("PRAGMA journal_mode = WAL")
-    secure_state_storage()
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            """
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            label TEXT,
-            capture_status TEXT NOT NULL DEFAULT 'complete',
-            capture_error TEXT
-        )
-            """
-        )
-        conn.execute(
-            """
-        CREATE TABLE IF NOT EXISTS windows (
-            id INTEGER PRIMARY KEY,
-            session INTEGER NOT NULL,
-            ord INTEGER NOT NULL,
-            class TEXT NOT NULL,
-            initial_class TEXT,
-            title TEXT,
-            initial_title TEXT,
-            cmdline TEXT NOT NULL,
-            cwd TEXT,
-            workspace_id INTEGER,
-            workspace_name TEXT,
-            monitor_name TEXT,
-            monitor_description TEXT,
-            at_x INTEGER, at_y INTEGER,
-            size_w INTEGER, size_h INTEGER,
-            floating INTEGER NOT NULL DEFAULT 0,
-            fullscreen INTEGER NOT NULL DEFAULT 0,
-            pinned INTEGER NOT NULL DEFAULT 0,
-            xwayland INTEGER NOT NULL DEFAULT 0,
-            pid INTEGER,
-            group_id INTEGER,
-            group_ord INTEGER,
-            FOREIGN KEY (session) REFERENCES sessions(id)
-        )
-            """
-        )
-        conn.execute(
-            """
-        CREATE TABLE IF NOT EXISTS workspace_layouts (
-            session INTEGER NOT NULL,
-            workspace_id INTEGER NOT NULL,
-            layout TEXT,
-            at_x INTEGER, at_y INTEGER,
-            size_w INTEGER, size_h INTEGER,
-            work_x INTEGER, work_y INTEGER,
-            work_w INTEGER, work_h INTEGER,
-            gap_top INTEGER, gap_right INTEGER,
-            gap_bottom INTEGER, gap_left INTEGER,
-            complete INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (session, workspace_id),
-            FOREIGN KEY (session) REFERENCES sessions(id)
-        )
-            """
-        )
-        conn.execute(
-            """
-        CREATE TABLE IF NOT EXISTS named_sessions (
-            name TEXT PRIMARY KEY,
-            session INTEGER NOT NULL UNIQUE,
-            FOREIGN KEY (session) REFERENCES sessions(id)
-        )
-            """
-        )
-        session_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(sessions)")
-        }
-        if "capture_status" not in session_columns:
-            conn.execute(
-                "ALTER TABLE sessions ADD COLUMN capture_status TEXT NOT NULL DEFAULT 'complete'"
+class SnapshotHistory:
+    """Persist and select immutable Snapshots without exposing SQLite."""
+
+    _WINDOW_COLUMNS = (
+        "ord",
+        "class",
+        "initial_class",
+        "title",
+        "initial_title",
+        "cmdline",
+        "cwd",
+        "workspace_id",
+        "workspace_name",
+        "monitor_name",
+        "monitor_description",
+        "at_x",
+        "at_y",
+        "size_w",
+        "size_h",
+        "floating",
+        "fullscreen",
+        "pinned",
+        "xwayland",
+        "pid",
+        "group_id",
+        "group_ord",
+    )
+
+    def _selected_window(self, values):
+        return SnapshotWindow(*values)
+
+    def __init__(self, path=None, *, read_only=False):
+        self._path = DB_PATH if path is None else Path(path)
+        self._read_only = read_only
+
+    def _connect(self):
+        if self._read_only:
+            connection = sqlite3.connect(
+                f"file:{self._path}?mode=ro", uri=True, timeout=5
             )
-            conn.execute(
-                "UPDATE sessions SET capture_status = 'legacy_unknown' "
-                "WHERE NOT EXISTS (SELECT 1 FROM windows WHERE windows.session = sessions.id)"
-            )
-        if "capture_error" not in session_columns:
-            conn.execute("ALTER TABLE sessions ADD COLUMN capture_error TEXT")
-        window_columns = {row[1] for row in conn.execute("PRAGMA table_info(windows)")}
-        if "pid" not in window_columns:
-            conn.execute("ALTER TABLE windows ADD COLUMN pid INTEGER")
-        if "monitor_description" not in window_columns:
-            conn.execute("ALTER TABLE windows ADD COLUMN monitor_description TEXT")
-        if "group_id" not in window_columns:
-            conn.execute("ALTER TABLE windows ADD COLUMN group_id INTEGER")
-        if "group_ord" not in window_columns:
-            conn.execute("ALTER TABLE windows ADD COLUMN group_ord INTEGER")
-        layout_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(workspace_layouts)")
-        }
-        for column in (
-            "work_x",
-            "work_y",
-            "work_w",
-            "work_h",
-            "gap_top",
-            "gap_right",
-            "gap_bottom",
-            "gap_left",
-        ):
-            if column not in layout_columns:
-                conn.execute(
-                    f"ALTER TABLE workspace_layouts ADD COLUMN {column} INTEGER"
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            return connection
+        if self._path == DB_PATH:
+            secure_state_storage()
+        else:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self._path, timeout=5)
+        private_file(self._path)
+        connection.execute("PRAGMA journal_mode = WAL")
+        if self._path == DB_PATH:
+            secure_state_storage()
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        self._migrate(connection)
+        return connection
+
+    def _migrate(self, connection):
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    label TEXT,
+                    capture_status TEXT NOT NULL DEFAULT 'complete',
+                    capture_error TEXT
                 )
-        conn.execute("PRAGMA user_version = 6")
-        conn.commit()
-        secure_state_storage()
-    except Exception:
-        conn.rollback()
-        conn.close()
-        raise
-    return conn
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS windows (
+                    id INTEGER PRIMARY KEY,
+                    session INTEGER NOT NULL,
+                    ord INTEGER NOT NULL,
+                    class TEXT NOT NULL,
+                    initial_class TEXT,
+                    title TEXT,
+                    initial_title TEXT,
+                    cmdline TEXT NOT NULL,
+                    cwd TEXT,
+                    workspace_id INTEGER,
+                    workspace_name TEXT,
+                    monitor_name TEXT,
+                    monitor_description TEXT,
+                    at_x INTEGER, at_y INTEGER,
+                    size_w INTEGER, size_h INTEGER,
+                    floating INTEGER NOT NULL DEFAULT 0,
+                    fullscreen INTEGER NOT NULL DEFAULT 0,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    xwayland INTEGER NOT NULL DEFAULT 0,
+                    pid INTEGER,
+                    group_id INTEGER,
+                    group_ord INTEGER,
+                    FOREIGN KEY (session) REFERENCES sessions(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workspace_layouts (
+                    session INTEGER NOT NULL,
+                    workspace_id INTEGER NOT NULL,
+                    layout TEXT,
+                    at_x INTEGER, at_y INTEGER,
+                    size_w INTEGER, size_h INTEGER,
+                    work_x INTEGER, work_y INTEGER,
+                    work_w INTEGER, work_h INTEGER,
+                    gap_top INTEGER, gap_right INTEGER,
+                    gap_bottom INTEGER, gap_left INTEGER,
+                    complete INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (session, workspace_id),
+                    FOREIGN KEY (session) REFERENCES sessions(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS named_sessions (
+                    name TEXT PRIMARY KEY,
+                    session INTEGER NOT NULL UNIQUE,
+                    FOREIGN KEY (session) REFERENCES sessions(id)
+                )
+                """
+            )
+            session_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(sessions)")
+            }
+            if "capture_status" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN capture_status "
+                    "TEXT NOT NULL DEFAULT 'complete'"
+                )
+                connection.execute(
+                    "UPDATE sessions SET capture_status = 'legacy_unknown' "
+                    "WHERE NOT EXISTS (SELECT 1 FROM windows "
+                    "WHERE windows.session = sessions.id)"
+                )
+            if "capture_error" not in session_columns:
+                connection.execute("ALTER TABLE sessions ADD COLUMN capture_error TEXT")
+            window_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(windows)")
+            }
+            if "pid" not in window_columns:
+                connection.execute("ALTER TABLE windows ADD COLUMN pid INTEGER")
+            if "monitor_description" not in window_columns:
+                connection.execute(
+                    "ALTER TABLE windows ADD COLUMN monitor_description TEXT"
+                )
+            if "group_id" not in window_columns:
+                connection.execute("ALTER TABLE windows ADD COLUMN group_id INTEGER")
+            if "group_ord" not in window_columns:
+                connection.execute("ALTER TABLE windows ADD COLUMN group_ord INTEGER")
+            layout_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(workspace_layouts)")
+            }
+            for column in (
+                "work_x",
+                "work_y",
+                "work_w",
+                "work_h",
+                "gap_top",
+                "gap_right",
+                "gap_bottom",
+                "gap_left",
+            ):
+                if column not in layout_columns:
+                    connection.execute(
+                        f"ALTER TABLE workspace_layouts ADD COLUMN {column} INTEGER"
+                    )
+            connection.execute("PRAGMA user_version = 6")
+            connection.commit()
+            if self._path == DB_PATH:
+                secure_state_storage()
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                connection.rollback()
+            with contextlib.suppress(sqlite3.Error):
+                connection.close()
+            raise
+
+    def _storage_error(self, error):
+        retryable = (
+            isinstance(error, sqlite3.OperationalError)
+            and any(word in str(error).lower() for word in ("busy", "locked"))
+        ) or (
+            isinstance(error, OSError)
+            and error.errno in (errno.EAGAIN, errno.EBUSY, errno.EINTR)
+        )
+        return SnapshotHistoryError(
+            "snapshot history operation failed", retryable=retryable
+        )
+
+    def contains_named(self, name):
+        session_name(name)
+        try:
+            with contextlib.closing(self._connect()) as connection:
+                return connection.execute(
+                    "SELECT 1 FROM named_sessions WHERE name = ?", (name,)
+                ).fetchone() is not None
+        except (sqlite3.Error, OSError) as error:
+            raise self._storage_error(error) from error
+
+    def record(self, capture, *, retention):
+        if not isinstance(capture, SnapshotCapture):
+            raise TypeError("capture must be a SnapshotCapture")
+        if capture.name is not None:
+            session_name(capture.name)
+        try:
+            with contextlib.closing(self._connect()) as connection:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    if capture.name is not None and connection.execute(
+                        "SELECT 1 FROM named_sessions WHERE name = ?", (capture.name,)
+                    ).fetchone():
+                        raise NamedSessionConflict(capture.name)
+                    cursor = connection.execute(
+                        "INSERT INTO sessions (label, capture_status, capture_error) "
+                        "VALUES (?, ?, ?)",
+                        (capture.label, capture.status, capture.error or None),
+                    )
+                    session_id = cursor.lastrowid
+                    connection.executemany(
+                        "INSERT INTO windows (session, ord, class, initial_class, title, initial_title, "
+                        "cmdline, cwd, workspace_id, workspace_name, monitor_name, monitor_description, "
+                        "at_x, at_y, size_w, size_h, floating, fullscreen, pinned, xwayland, pid, "
+                        "group_id, group_ord) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        "?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (
+                                session_id,
+                                index,
+                                row.get("class"),
+                                row.get("initial_class"),
+                                row.get("title"),
+                                row.get("initial_title"),
+                                row.get("cmdline"),
+                                row.get("cwd"),
+                                row.get("workspace_id"),
+                                row.get("workspace_name"),
+                                row.get("monitor_name"),
+                                row.get("monitor_description"),
+                                row.get("at_x"),
+                                row.get("at_y"),
+                                row.get("size_w"),
+                                row.get("size_h"),
+                                row.get("floating", 0),
+                                row.get("fullscreen", 0),
+                                row.get("pinned", 0),
+                                row.get("xwayland", 0),
+                                row.get("pid"),
+                                row.get("group_id"),
+                                row.get("group_ord"),
+                            )
+                            for index, row in enumerate(capture.windows)
+                        ],
+                    )
+                    connection.executemany(
+                        "INSERT INTO workspace_layouts (session, workspace_id, layout, at_x, at_y, "
+                        "size_w, size_h, work_x, work_y, work_w, work_h, gap_top, gap_right, "
+                        "gap_bottom, gap_left, complete) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        "?, ?, ?, ?, ?)",
+                        [
+                            (
+                                session_id,
+                                layout.get("workspace_id"),
+                                layout.get("layout"),
+                                layout.get("at_x"),
+                                layout.get("at_y"),
+                                layout.get("size_w"),
+                                layout.get("size_h"),
+                                layout.get("work_x"),
+                                layout.get("work_y"),
+                                layout.get("work_w"),
+                                layout.get("work_h"),
+                                layout.get("gap_top"),
+                                layout.get("gap_right"),
+                                layout.get("gap_bottom"),
+                                layout.get("gap_left"),
+                                layout.get("complete", 0),
+                            )
+                            for layout in capture.workspace_layouts
+                        ],
+                    )
+                    if capture.name is not None and capture.status == "complete":
+                        try:
+                            connection.execute(
+                                "INSERT INTO named_sessions (name, session) VALUES (?, ?)",
+                                (capture.name, session_id),
+                            )
+                        except sqlite3.IntegrityError as error:
+                            raise NamedSessionConflict(capture.name) from error
+                    keep_ids = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT id FROM sessions WHERE capture_status = 'complete' "
+                            "AND NOT EXISTS (SELECT 1 FROM named_sessions n WHERE n.session = sessions.id) "
+                            "ORDER BY id DESC LIMIT ?",
+                            (retention,),
+                        )
+                    }
+                    keep_ids.update(
+                        row[0]
+                        for row in connection.execute("SELECT session FROM named_sessions")
+                    )
+                    keep_ids.update(
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT id FROM sessions WHERE capture_status != 'complete' "
+                            "ORDER BY id DESC LIMIT ?",
+                            (retention,),
+                        )
+                    )
+                    prune_ids = [
+                        row[0]
+                        for row in connection.execute("SELECT id FROM sessions")
+                        if row[0] not in keep_ids
+                    ]
+                    for stale_id in prune_ids:
+                        connection.execute(
+                            "DELETE FROM workspace_layouts WHERE session = ?", (stale_id,)
+                        )
+                        connection.execute(
+                            "DELETE FROM windows WHERE session = ?", (stale_id,)
+                        )
+                    connection.executemany(
+                        "DELETE FROM sessions WHERE id = ?",
+                        [(stale_id,) for stale_id in prune_ids],
+                    )
+                    connection.commit()
+                except Exception:
+                    with contextlib.suppress(sqlite3.Error):
+                        connection.rollback()
+                    raise
+        except (sqlite3.Error, OSError) as error:
+            raise self._storage_error(error) from error
+        return session_id
+
+    def select(self, *, name=None, session_id=None):
+        if name is not None and session_id is not None:
+            raise ValueError("select accepts either name or session_id")
+        if name is not None:
+            session_name(name)
+        try:
+            with contextlib.closing(self._connect()) as connection:
+                try:
+                    connection.execute("BEGIN")
+                    if name is not None:
+                        row = connection.execute(
+                            "SELECT s.id, s.label, s.created_at, s.capture_status, s.capture_error "
+                            "FROM named_sessions n JOIN sessions s ON s.id = n.session "
+                            "WHERE n.name = ? AND s.capture_status = 'complete'",
+                            (name,),
+                        ).fetchone()
+                    elif session_id is not None:
+                        row = connection.execute(
+                            "SELECT id, label, created_at, capture_status, capture_error "
+                            "FROM sessions WHERE id = ?",
+                            (session_id,),
+                        ).fetchone()
+                    else:
+                        row = connection.execute(
+                            "SELECT id, label, created_at, capture_status, capture_error "
+                            "FROM sessions s WHERE capture_status = 'complete' AND NOT EXISTS "
+                            "(SELECT 1 FROM named_sessions n WHERE n.session = s.id) "
+                            "ORDER BY s.id DESC LIMIT 1"
+                        ).fetchone()
+                    if row is None:
+                        connection.commit()
+                        return None
+                    windows_cursor = connection.execute(
+                        f"SELECT {', '.join(self._WINDOW_COLUMNS)} FROM windows "
+                        "WHERE session = ? ORDER BY ord",
+                        (row[0],),
+                    )
+                    windows = tuple(
+                        self._selected_window(window)
+                        for window in windows_cursor.fetchall()
+                    )
+                    layout_cursor = connection.execute(
+                        "SELECT workspace_id, layout, at_x, at_y, size_w, size_h, "
+                        "work_x, work_y, work_w, work_h, gap_top, gap_right, gap_bottom, "
+                        "gap_left, complete FROM workspace_layouts WHERE session = ?",
+                        (row[0],),
+                    )
+                    layout_columns = [column[0] for column in layout_cursor.description]
+                    layouts = {
+                        layout[0]: dict(zip(layout_columns, layout))
+                        for layout in layout_cursor.fetchall()
+                    }
+                    snapshot = Snapshot(
+                        row[0], windows, layouts, row[1], row[2], row[3], row[4]
+                    )
+                    connection.commit()
+                    return snapshot
+                except Exception:
+                    with contextlib.suppress(sqlite3.Error):
+                        connection.rollback()
+                    raise
+        except (sqlite3.Error, OSError) as error:
+            raise self._storage_error(error) from error
+
+    def list_named(self):
+        try:
+            with contextlib.closing(self._connect()) as connection:
+                rows = connection.execute(
+                    "SELECT s.id, s.label, s.created_at, COUNT(w.id), s.capture_status, n.name "
+                    "FROM named_sessions n JOIN sessions s ON s.id = n.session "
+                    "LEFT JOIN windows w ON w.session = s.id GROUP BY n.name, s.id, s.label, "
+                    "s.created_at, s.capture_status ORDER BY n.name COLLATE BINARY"
+                ).fetchall()
+        except (sqlite3.Error, OSError) as error:
+            raise self._storage_error(error) from error
+        return tuple(SnapshotSummary(*row) for row in rows)
+
+    def recent(self, limit=5):
+        try:
+            with contextlib.closing(self._connect()) as connection:
+                rows = connection.execute(
+                    "SELECT s.id, s.label, s.created_at, COUNT(w.id), s.capture_status, n.name "
+                    "FROM sessions s LEFT JOIN windows w ON w.session = s.id "
+                    "LEFT JOIN named_sessions n ON n.session = s.id "
+                    "GROUP BY s.id, s.label, s.created_at, s.capture_status, n.name "
+                    "ORDER BY s.id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        except (sqlite3.Error, OSError) as error:
+            raise self._storage_error(error) from error
+        return tuple(SnapshotSummary(*row) for row in rows)
+
+    def delete_named(self, name):
+        session_name(name)
+        try:
+            with contextlib.closing(self._connect()) as connection:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    row = connection.execute(
+                        "SELECT s.id, s.label, s.created_at, COUNT(w.id), s.capture_status, n.name "
+                        "FROM named_sessions n JOIN sessions s ON s.id = n.session "
+                        "LEFT JOIN windows w ON w.session = s.id WHERE n.name = ? "
+                        "GROUP BY s.id, s.label, s.created_at, s.capture_status, n.name",
+                        (name,),
+                    ).fetchone()
+                    if row is None:
+                        connection.rollback()
+                        return None
+                    session_id = row[0]
+                    connection.execute(
+                        "DELETE FROM named_sessions WHERE name = ?", (name,)
+                    )
+                    connection.execute(
+                        "DELETE FROM workspace_layouts WHERE session = ?", (session_id,)
+                    )
+                    connection.execute(
+                        "DELETE FROM windows WHERE session = ?", (session_id,)
+                    )
+                    connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                    connection.commit()
+                    return SnapshotSummary(*row)
+                except Exception:
+                    with contextlib.suppress(sqlite3.Error):
+                        connection.rollback()
+                    raise
+        except (sqlite3.Error, OSError) as error:
+            raise self._storage_error(error) from error
 
 
 def read_proc(pid):
@@ -629,88 +1747,6 @@ def read_proc(pid):
     return cmdline, cwd, "" if cmdline else "empty cmdline"
 
 
-def persist_snapshot(
-    label,
-    status,
-    error,
-    rows,
-    workspace_layouts=None,
-    snapshot_retention=5,
-    name=None,
-):
-    if name is not None:
-        session_name(name)
-    conn = db_conn()
-    if name is not None and conn.execute(
-        "SELECT 1 FROM named_sessions WHERE name = ?", (name,)
-    ).fetchone():
-        conn.close()
-        raise NamedSessionConflict(name)
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO sessions (label, capture_status, capture_error) VALUES (?, ?, ?)",
-            (label, status, error or None),
-        )
-        sid = cur.lastrowid
-        conn.executemany(
-            "INSERT INTO windows (session, ord, class, initial_class, title, initial_title, "
-            "cmdline, cwd, workspace_id, workspace_name, monitor_name, monitor_description, at_x, at_y, size_w, "
-            "size_h, floating, fullscreen, pinned, xwayland, pid, group_id, group_ord) "
-            "VALUES (:session, :ord, :class, :initial_class, :title, :initial_title, "
-            ":cmdline, :cwd, :workspace_id, :workspace_name, :monitor_name, :monitor_description, :at_x, :at_y, "
-            ":size_w, :size_h, :floating, :fullscreen, :pinned, :xwayland, :pid, :group_id, :group_ord)",
-            [dict(r, session=sid, ord=i) for i, r in enumerate(rows)],
-        )
-        conn.executemany(
-            "INSERT INTO workspace_layouts "
-            "(session, workspace_id, layout, at_x, at_y, size_w, size_h, "
-            "work_x, work_y, work_w, work_h, gap_top, gap_right, gap_bottom, "
-            "gap_left, complete) "
-            "VALUES (:session, :workspace_id, :layout, :at_x, :at_y, :size_w, "
-            ":size_h, :work_x, :work_y, :work_w, :work_h, :gap_top, "
-            ":gap_right, :gap_bottom, :gap_left, :complete)",
-            [dict(layout, session=sid) for layout in workspace_layouts or ()],
-        )
-        if name is not None and status == "complete":
-            conn.execute(
-                "INSERT INTO named_sessions (name, session) VALUES (?, ?)", (name, sid)
-            )
-        keep_ids = {
-            row[0]
-            for row in conn.execute(
-                "SELECT id FROM sessions WHERE capture_status = 'complete' "
-                "AND NOT EXISTS (SELECT 1 FROM named_sessions n "
-                "WHERE n.session = sessions.id) "
-                "ORDER BY id DESC LIMIT ?",
-                (snapshot_retention,),
-            )
-        }
-        keep_ids.update(row[0] for row in conn.execute("SELECT session FROM named_sessions"))
-        keep_ids.update(
-            row[0]
-            for row in conn.execute(
-                "SELECT id FROM sessions WHERE capture_status != 'complete' "
-                "ORDER BY id DESC LIMIT ?",
-                (snapshot_retention,),
-            )
-        )
-        prune_ids = [
-            row[0]
-            for row in conn.execute("SELECT id FROM sessions")
-            if row[0] not in keep_ids
-        ]
-        for session_id in prune_ids:
-            conn.execute(
-                "DELETE FROM workspace_layouts WHERE session = ?", (session_id,)
-            )
-            conn.execute("DELETE FROM windows WHERE session = ?", (session_id,))
-        conn.executemany(
-            "DELETE FROM sessions WHERE id = ?", [(sid,) for sid in prune_ids]
-        )
-    conn.close()
-    return sid
-
-
 def cmd_save(label="manual", teardown=False, wait=False, name=None):
     if name is not None:
         session_name(name)
@@ -720,13 +1756,9 @@ def cmd_save(label="manual", teardown=False, wait=False, name=None):
         log(f"save[{label}]: another session operation is running")
         return 75
     try:
+        history = SnapshotHistory()
         if name is not None:
-            conn = db_conn()
-            exists = conn.execute(
-                "SELECT 1 FROM named_sessions WHERE name = ?", (name,)
-            ).fetchone()
-            conn.close()
-            if exists:
+            if history.contains_named(name):
                 print(f"save failed: named session {name!r} already exists", file=sys.stderr)
                 log(f"save[{label}]: named session {name!r} already exists")
                 return 1
@@ -740,38 +1772,24 @@ def cmd_save(label="manual", teardown=False, wait=False, name=None):
         ):
             log("save[logout]: could not close the autosave gate")
             return 75
-        clients = hyprctl_json("clients")
-        monitors = hyprctl_json("monitors")
-        workspaces = hyprctl_json("workspaces")
-        gaps_out = hyprctl_json("getoption", "general:gaps_out")
-        gaps_in = hyprctl_json("getoption", "general:gaps_in")
-        workspace_rules = hyprctl_json("workspacerules")
-        if any(
-            value is None
-            for value in (
-                clients,
-                monitors,
-                workspaces,
-                gaps_out,
-                gaps_in,
-                workspace_rules,
-            )
-        ):
+        captured = ProductionHyprland().capture()
+        if captured.status is ObservationStatus.UNAVAILABLE:
             log(f"save[{label}]: capture failed because Hyprland IPC is unavailable")
             print("save failed: Hyprland IPC is unavailable", file=sys.stderr)
-            return 1
+            return 75
+        capture = captured.capture
         status = "failed" if teardown else "complete"
         errors = ["teardown captures are diagnostic only"] if teardown else []
         return _save_clients(
             label,
-            clients,
-            monitors,
+            capture.windows,
+            capture.displays,
             status,
             errors,
-            workspaces=workspaces,
-            gaps_out=css_gaps(gaps_out),
-            gaps_in=css_gaps(gaps_in),
-            workspace_rules=workspace_rules,
+            workspaces=capture.workspaces,
+            gaps_out=css_gaps(capture.outer_gaps),
+            gaps_in=css_gaps(capture.inner_gaps),
+            workspace_rules=capture.workspace_rules,
             cfg=cfg,
             name=name,
         )
@@ -817,7 +1835,7 @@ def assign_snapshot_groups(captured):
 
 
 def css_gaps(option):
-    value = option.get("css") if isinstance(option, dict) else None
+    value = option.get("css") if isinstance(option, Mapping) else None
     if not isinstance(value, str):
         return None
     try:
@@ -1016,14 +2034,9 @@ def _save_clients(
         status = "partial"
     error = "; ".join(errors)
     try:
-        sid = persist_snapshot(
-            label,
-            status,
-            error,
-            rows,
-            workspace_layouts,
-            cfg["snapshot_retention"],
-            name,
+        sid = SnapshotHistory().record(
+            SnapshotCapture(label, status, error, rows, workspace_layouts, name),
+            retention=cfg["snapshot_retention"],
         )
     except NamedSessionConflict:
         print(f"save failed: named session {name!r} already exists", file=sys.stderr)
@@ -1031,6 +2044,7 @@ def _save_clients(
         return 1
     if status == "complete" and (label == "manual" or name is not None):
         mark_restore_completed(sid)
+        write_current_session_name(name)
     log(
         f"save[{label}]: {len(rows)} windows -> session {sid} ({status}){': ' + error if error else ''}"
     )
@@ -1044,44 +2058,6 @@ def _save_clients(
             file=sys.stderr,
         )
     return 0 if status == "complete" else 1
-
-
-def latest_session(conn):
-    cur = conn.execute(
-        "SELECT id, label, created_at FROM sessions s "
-        "WHERE capture_status = 'complete' "
-        "AND NOT EXISTS (SELECT 1 FROM named_sessions n WHERE n.session = s.id) "
-        "ORDER BY s.id DESC LIMIT 1"
-    )
-    return cur.fetchone()
-
-
-def named_session(conn, name):
-    cur = conn.execute(
-        "SELECT s.id, s.label, s.created_at FROM named_sessions n "
-        "JOIN sessions s ON s.id = n.session "
-        "WHERE n.name = ? AND s.capture_status = 'complete'",
-        (name,),
-    )
-    return cur.fetchone()
-
-
-def load_windows(conn, sid):
-    cur = conn.execute("SELECT * FROM windows WHERE session = ? ORDER BY ord", (sid,))
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-
-def load_workspace_layouts(conn, sid):
-    cur = conn.execute(
-        "SELECT workspace_id, layout, at_x, at_y, size_w, size_h, "
-        "work_x, work_y, work_w, work_h, gap_top, gap_right, gap_bottom, "
-        "gap_left, complete "
-        "FROM workspace_layouts WHERE session = ?",
-        (sid,),
-    )
-    cols = [d[0] for d in cur.description]
-    return {row[0]: dict(zip(cols, row)) for row in cur.fetchall()}
 
 
 def window_classes_match(saved, current):
@@ -1255,7 +2231,7 @@ def match_windows(rows, clients, used_addresses=None, max_rank=2):
     return matches
 
 
-def window_placement_operations(w, address, current=None):
+def _production_window_placement_operations(w, address, current=None):
     """Lua dispatches that move one matched window to its saved state.
 
     A property whose live client already matches the snapshot is skipped, so an
@@ -1345,29 +2321,98 @@ def window_placement_operations(w, address, current=None):
 
 def place_window(w, address, current=None, *, compositor=None):
     if not address:
-        return False
-    operations = window_placement_operations(w, address, current)
-    if not operations:
-        return True
-    # One synchronous evaluation prevents separate IPC requests from
-    # interleaving. Every dispatch is still attempted so a single failed
-    # property does not skip the rest of the placement.
-    script = [
-        "local failed=0",
-        *(
-            f"if not hl.dispatch({operation}).ok then failed=failed+1 end"
-            for operation in operations
-        ),
-        "if failed>0 then error(failed..' placement dispatches failed') end",
-    ]
-    compositor = compositor or HyprlandRestoreAdapter()
-    return bool(compositor.evaluate(" ".join(script)))
+        return MutationResult(MutationStatus.REJECTED)
+    compositor = compositor or ProductionHyprland()
+    return compositor.apply(
+        PlaceWindow(window=w, address=address, current=current)
+    )
+
+
+def _production_action(action):
+    if isinstance(action, SetAnimations):
+        enabled = "true" if action.enabled else "false"
+        return (
+            f"hl.config({{ animations = {{ enabled = {enabled} }} }}) "
+            f"if hl.get_config('animations:enabled') ~= {enabled} then "
+            "error('animations:enabled did not change') end",
+            False,
+            None,
+        )
+    if isinstance(action, PlaceWindow):
+        operations = _production_window_placement_operations(
+            action.window, action.address, action.current
+        )
+        script = [
+            "local failed=0",
+            *(
+                f"if not hl.dispatch({operation}).ok then failed=failed+1 end"
+                for operation in operations
+            ),
+            "if failed>0 then error(failed..' placement dispatches failed') end",
+        ]
+        return " ".join(script), not operations, None
+    if isinstance(action, MoveWindowToWorkspace):
+        window = lua_quote("address:" + action.address)
+        lua = (
+            "hl.dsp.window.move({ "
+            f"workspace = {action.workspace_id}, follow = false, "
+            f"window = {window} "
+            "})"
+        )
+    elif isinstance(action, MoveWorkspaceToDisplay):
+        lua = (
+            "hl.dsp.workspace.move({ "
+            f"workspace = {action.workspace_id}, "
+            f"monitor = {lua_quote(action.display)} "
+            "})"
+        )
+    elif isinstance(action, LaunchApplication):
+        rules = []
+        if action.workspace_id is not None:
+            workspace = lua_quote(f"{action.workspace_id} silent")
+            rules.append(f"workspace = {workspace}")
+        if action.floating:
+            rules.append("float = true")
+        lua = f"hl.dsp.exec_cmd({lua_quote(action.command)}, {{ {', '.join(rules)} }})"
+        return lua, False, "restore: application launch"
+    elif isinstance(action, SwapWindows):
+        window = lua_quote("address:" + action.address)
+        target = lua_quote("address:" + action.target)
+        lua = (
+            "hl.dsp.window.swap({ "
+            f"window = {window}, target = {target} "
+            "})"
+        )
+    elif isinstance(action, ResizeWindow):
+        window = lua_quote("address:" + action.address)
+        lua = (
+            "hl.dsp.window.resize({ "
+            f"x = {action.width}, y = {action.height}, "
+            f"window = {window} "
+            "})"
+        )
+    elif isinstance(action, FocusWindow):
+        window = lua_quote("address:" + action.address)
+        lua = f"hl.dsp.focus({{ window = {window} }})"
+    elif isinstance(action, FocusWorkspace):
+        lua = f"hl.dsp.focus({{ workspace = {action.workspace_id} }})"
+    elif isinstance(action, FocusDisplay):
+        lua = f"hl.dsp.focus({{ monitor = {lua_quote(action.display)} }})"
+    elif isinstance(action, ToggleSpecialWorkspace):
+        lua = f"hl.dsp.workspace.toggle_special({lua_quote(action.name)})"
+    elif isinstance(action, ReplayWorkspaceTree):
+        lua = _production_replay_workspace_tree(action)
+    elif isinstance(action, RestoreWindowGroup):
+        lua = _production_restore_window_group(action.addresses)
+    else:
+        raise TypeError(f"unsupported Hyprland action: {type(action).__name__}")
+    return lua, False, None
 
 
 def verify_floating_placements(
     rows, matches, *, compositor=None, clock=None, write_log=None
 ):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     clock = clock or SystemClockAdapter()
     write_log = log if write_log is None else write_log
     expected = [
@@ -1381,7 +2426,7 @@ def verify_floating_placements(
         return True
 
     clock.sleep(RESTORE_POLL_INTERVAL)
-    clients = compositor.query_json("clients")
+    clients = observed(compositor, ObservationKind.WINDOWS)
     if clients is None:
         return None
     current = {client.get("address"): client for client in clients}
@@ -1395,16 +2440,18 @@ def verify_floating_placements(
 
     mutation_ok = True
     for row in mismatched:
-        placed = place_window(
+        placement = place_window(
             row,
             matches[row["id"]],
             current.get(matches[row["id"]]),
             compositor=compositor,
         )
-        if not placed:
+        if placement.status is MutationStatus.UNAVAILABLE:
+            return None
+        if not placement.succeeded:
             mutation_ok = False
     clock.sleep(RESTORE_POLL_INTERVAL)
-    clients = compositor.query_json("clients")
+    clients = observed(compositor, ObservationKind.WINDOWS)
     if clients is None:
         return None
     current = {client.get("address"): client for client in clients}
@@ -1518,10 +2565,10 @@ def workspace_monitor_targets(
 def load_workspace_monitor_context(
     rows, monitor_fallback="focused", *, compositor=None, write_log=None
 ):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     write_log = log if write_log is None else write_log
-    monitors = compositor.query_json("monitors")
-    workspaces = compositor.query_json("workspaces")
+    monitors = observed(compositor, ObservationKind.DISPLAYS)
+    workspaces = observed(compositor, ObservationKind.WORKSPACES)
     if monitors is None or workspaces is None or not monitors:
         write_log("restore: Hyprland IPC failed while remapping workspace monitors")
         return {}, {}, True
@@ -1541,29 +2588,28 @@ def load_workspace_monitor_context(
 def prepare_workspace_monitor(
     row, address, targets, current_monitors, prepared, *, compositor=None
 ):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     workspace_id = row.get("workspace_id")
     target = targets.get(workspace_id)
     if target is None or workspace_id in prepared:
-        return True
+        return WorkspaceMoveResult(MutationStatus.UNCHANGED)
     if current_monitors.get(workspace_id) == target:
         prepared.add(workspace_id)
-        return True
+        return WorkspaceMoveResult(MutationStatus.UNCHANGED)
 
-    win = lua_quote(f"address:{address}")
-    if not compositor.dispatch(
-        f"hl.dsp.window.move({{ workspace = {workspace_id}, follow = false, window = {win} }})"
-    ):
-        return False
-    if not compositor.dispatch(
-        "hl.dsp.workspace.move({ "
-        f"workspace = {workspace_id}, monitor = {lua_quote(target)} "
-        "})"
-    ):
-        return False
+    window_move = compositor.apply(
+        MoveWindowToWorkspace(address=address, workspace_id=workspace_id)
+    )
+    if not window_move.succeeded:
+        return window_move
+    workspace_move = compositor.apply(
+        MoveWorkspaceToDisplay(workspace_id=workspace_id, display=target)
+    )
+    if not workspace_move.succeeded:
+        return workspace_move
     current_monitors[workspace_id] = target
     prepared.add(workspace_id)
-    return True
+    return workspace_move
 
 
 def geometries_match(left, right, tolerance=2):
@@ -1773,9 +2819,9 @@ def split_tree_seed(tree):
 
 
 def nested_replay_supported(*, compositor=None, write_log=None):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     write_log = log if write_log is None else write_log
-    version = compositor.query_json("version")
+    version = observed(compositor, ObservationKind.VERSION)
     if version is None:
         return None
     match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", str(version.get("version", "")))
@@ -1787,9 +2833,7 @@ def nested_replay_supported(*, compositor=None, write_log=None):
         "dwindle:preserve_split": True,
         "dwindle:permanent_direction_override": False,
     }
-    values = compositor.query_batch_json(
-        *(f"getoption {option}" for option in required)
-    )
+    values = observed(compositor, ObservationKind.TREE_REPLAY_SETTINGS)
     if values is None:
         return None
     for (option, expected), value in zip(required.items(), values):
@@ -1843,8 +2887,29 @@ def workspace_geometry_matches(
 def replay_workspace_tree(
     workspace_id, rows, matches, tree, focus_context, *, compositor=None
 ):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     addresses = [matches[row["id"]] for row in rows]
+    result = compositor.apply(
+        ReplayWorkspaceTree(
+            workspace_id=workspace_id,
+            rows=rows,
+            matches=matches,
+            tree=tree,
+            focus=focus_context,
+            stage_id=f"omarchy-sesh-stage-{os.getpid()}-{workspace_id}",
+        )
+    )
+    if result.status is MutationStatus.UNAVAILABLE:
+        return None, addresses
+    return result.succeeded, addresses
+
+
+def _production_replay_workspace_tree(action):
+    workspace_id = action.workspace_id
+    rows = action.rows
+    matches = action.matches
+    tree = action.tree
+    focus_context = action.focus
     variable_by_id = {
         row["id"]: f"w{index}" for index, row in enumerate(rows, start=1)
     }
@@ -1853,7 +2918,7 @@ def replay_workspace_tree(
         for row in rows
     ]
     operations = []
-    staging = lua_quote(f"name:omarchy-sesh-stage-{os.getpid()}-{workspace_id}")
+    staging = lua_quote("name:" + action.stage_id)
     seed_id = split_tree_seed(tree)
     for row in rows:
         if row["id"] == seed_id:
@@ -1915,17 +2980,15 @@ def replay_workspace_tree(
     if focus_action:
         script.append(f"local focus={focus_action}")
     script.append("if not ok then error(err) end")
-    result = compositor.evaluate(" ".join(script))
-    return result, addresses
+    return " ".join(script)
 
 
 def load_focus_context(*, compositor=None):
-    compositor = compositor or HyprlandRestoreAdapter()
-    active_window = compositor.query_json("activewindow")
-    active_workspace = compositor.query_json("activeworkspace")
-    monitors = compositor.query_json("monitors")
-    if active_window is None or active_workspace is None or monitors is None:
+    compositor = compositor or ProductionHyprland()
+    focus = observed(compositor, ObservationKind.FOCUS)
+    if focus is None:
         return None
+    active_window, active_workspace, monitors = focus
     focused_monitor = next(
         (monitor for monitor in monitors if monitor.get("focused")), {}
     )
@@ -1939,19 +3002,18 @@ def load_focus_context(*, compositor=None):
 
 
 def restore_focus_context(context, *, compositor=None):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     if not context:
         return True
     address = context.get("address")
     workspace_id = context.get("workspace_id")
     special_workspace = context.get("special_workspace")
     if address:
-        lua = f"hl.dsp.focus({{ window = {lua_quote(f'address:{address}')} }})"
-        dispatched = compositor.dispatch(lua)
-        current = compositor.query_json("activewindow")
+        dispatched = compositor.apply(FocusWindow(address=address))
+        current = observed(compositor, ObservationKind.FOCUSED_WINDOW)
         if current is None:
             return None
-        if dispatched and current.get("address") == address:
+        if dispatched.succeeded and current.get("address") == address:
             return True
         if special_workspace:
             return restore_focus_context(
@@ -1959,12 +3021,11 @@ def restore_focus_context(context, *, compositor=None):
             )
         if workspace_id is None:
             return False
-        lua = f"hl.dsp.focus({{ workspace = {workspace_id} }})"
-        endpoint = "activeworkspace"
+        action = FocusWorkspace(workspace_id=workspace_id)
         expected = workspace_id
-        field = "id"
+        observation_kind = ObservationKind.FOCUSED_WORKSPACE
     elif special_workspace:
-        monitors = compositor.query_json("monitors")
+        monitors = observed(compositor, ObservationKind.DISPLAYS)
         if monitors is None:
             return None
         monitor_name = context.get("monitor_name")
@@ -1985,11 +3046,12 @@ def restore_focus_context(context, *, compositor=None):
 
         if special_is_focused(monitors):
             return True
-        if not monitor_name or not compositor.dispatch(
-            f"hl.dsp.focus({{ monitor = {lua_quote(monitor_name)} }})"
-        ):
-            return None if compositor.query_json("monitors") is None else False
-        monitors = compositor.query_json("monitors")
+        if not monitor_name:
+            return False
+        dispatched = compositor.apply(FocusDisplay(display=monitor_name))
+        if not dispatched.succeeded:
+            return None if dispatched.status is MutationStatus.UNAVAILABLE else False
+        monitors = observed(compositor, ObservationKind.DISPLAYS)
         if monitors is None:
             return None
         if not any(
@@ -1999,35 +3061,33 @@ def restore_focus_context(context, *, compositor=None):
             for monitor in monitors
         ):
             toggle_name = special_workspace.removeprefix("special:")
-            if not compositor.dispatch(
-                "hl.dsp.workspace.toggle_special("
-                f"{lua_quote(toggle_name)}"
-                ")"
-            ):
-                return None if compositor.query_json("monitors") is None else False
-            monitors = compositor.query_json("monitors")
+            toggled = compositor.apply(
+                ToggleSpecialWorkspace(name=toggle_name)
+            )
+            if not toggled.succeeded:
+                return None if toggled.status is MutationStatus.UNAVAILABLE else False
+            monitors = observed(compositor, ObservationKind.DISPLAYS)
             if monitors is None:
                 return None
         return special_is_focused(monitors)
     elif workspace_id is not None:
-        lua = f"hl.dsp.focus({{ workspace = {workspace_id} }})"
-        endpoint = "activeworkspace"
+        action = FocusWorkspace(workspace_id=workspace_id)
         expected = workspace_id
-        field = "id"
+        observation_kind = ObservationKind.FOCUSED_WORKSPACE
     else:
         return True
-    dispatched = compositor.dispatch(lua)
-    current = compositor.query_json(endpoint)
+    dispatched = compositor.apply(action)
+    current = observed(compositor, observation_kind)
     if current is None:
         return None
-    return dispatched and current.get(field) == expected
+    return dispatched.succeeded and current.get("id") == expected
 
 
 def recover_replay_workspace(
     workspace_id, addresses, focus_context, *, compositor=None
 ):
-    compositor = compositor or HyprlandRestoreAdapter()
-    clients = compositor.query_json("clients")
+    compositor = compositor or ProductionHyprland()
+    clients = observed(compositor, ObservationKind.WINDOWS)
     if clients is None:
         return None
     workspace_by_address = {
@@ -2036,14 +3096,11 @@ def recover_replay_workspace(
     }
     for address in addresses:
         if workspace_by_address.get(address) != workspace_id:
-            moved = compositor.dispatch(
-                "hl.dsp.window.move({ "
-                f"workspace = {workspace_id}, follow = false, "
-                f"window = {lua_quote(f'address:{address}')} "
-                "})"
+            moved = compositor.apply(
+                MoveWindowToWorkspace(address=address, workspace_id=workspace_id)
             )
-            if not moved:
-                return None if compositor.query_json("clients") is None else False
+            if not moved.succeeded:
+                return None if moved.status is MutationStatus.UNAVAILABLE else False
     return restore_focus_context(focus_context, compositor=compositor)
 
 
@@ -2057,7 +3114,7 @@ def restore_nested_tiled_layouts(
     compositor=None,
     write_log=None,
 ):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     write_log = log if write_log is None else write_log
     rows_by_workspace = {}
     for row in rows:
@@ -2069,16 +3126,16 @@ def restore_nested_tiled_layouts(
         for workspace_id, workspace_rows in rows_by_workspace.items()
     ):
         return True
-    workspace_rules = compositor.query_json("workspacerules")
+    workspace_rules = observed(compositor, ObservationKind.WORKSPACE_RULES)
     if workspace_rules is None:
         return None
     if workspace_rules:
         write_log("restore: workspace-specific rules disable dwindle tree replay")
         return True
-    live_workspaces = compositor.query_json("workspaces")
-    live_monitors = compositor.query_json("monitors")
-    gaps_out = compositor.query_json("getoption", "general:gaps_out")
-    gaps_in = compositor.query_json("getoption", "general:gaps_in")
+    live_workspaces = observed(compositor, ObservationKind.WORKSPACES)
+    live_monitors = observed(compositor, ObservationKind.DISPLAYS)
+    gaps_out = observed(compositor, ObservationKind.OUTER_GAPS)
+    gaps_in = observed(compositor, ObservationKind.INNER_GAPS)
     if any(value is None for value in (live_workspaces, live_monitors, gaps_out, gaps_in)):
         return None
     gaps_out = css_gaps(gaps_out)
@@ -2176,7 +3233,7 @@ def restore_nested_tiled_layouts(
             continue
         current, client_by_address = context
         if any(
-            client.get("grouped") not in (None, [])
+            bool(client.get("grouped"))
             or client.get("pinned")
             for client in current
         ) or any(
@@ -2225,7 +3282,7 @@ def restore_nested_tiled_layouts(
                 workspace_id, addresses, focus_context, compositor=compositor
             )
             return None
-        refreshed = compositor.query_json("clients")
+        refreshed = observed(compositor, ObservationKind.WINDOWS)
         if refreshed is None:
             recover_replay_workspace(
                 workspace_id, addresses, focus_context, compositor=compositor
@@ -2326,7 +3383,7 @@ def two_window_geometry_matches(rows, matches, current):
 def restore_tiled_slots(
     rows, matches, clients, *, compositor=None, write_log=None
 ):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     write_log = log if write_log is None else write_log
     rows_by_workspace = {}
     all_ok = True
@@ -2369,12 +3426,11 @@ def restore_tiled_slots(
         ]
         occupant_order = [current[index]["address"] for index in current_split[1]]
         if desired_order != occupant_order:
-            window = lua_quote(f"address:{desired_order[0]}")
-            target = lua_quote(f"address:{occupant_order[0]}")
-            if not compositor.dispatch(
-                f"hl.dsp.window.swap({{ window = {window}, target = {target} }})"
-            ):
-                if compositor.query_json("clients") is None:
+            result = compositor.apply(
+                SwapWindows(address=desired_order[0], target=occupant_order[0])
+            )
+            if not result.succeeded:
+                if result.status is MutationStatus.UNAVAILABLE:
                     write_log(
                         "restore: Hyprland IPC failed while arranging tiled windows"
                     )
@@ -2385,7 +3441,7 @@ def restore_tiled_slots(
             swapped_workspaces.add(workspace_id)
 
     if swapped_workspaces:
-        clients = compositor.query_json("clients")
+        clients = observed(compositor, ObservationKind.WINDOWS)
         if clients is None:
             write_log("restore: Hyprland IPC failed after arranging tiled windows")
             return None
@@ -2447,13 +3503,13 @@ def restore_tiled_slots(
                 )
                 candidates.append((error, client, desired))
         _, client, desired = max(candidates, key=lambda candidate: candidate[0])
-        window = lua_quote(f"address:{client['address']}")
-        if not compositor.dispatch(
-            "hl.dsp.window.resize({ "
-            f"x = {desired[2]}, y = {desired[3]}, window = {window} "
-            "})"
-        ):
-            if compositor.query_json("clients") is None:
+        result = compositor.apply(
+            ResizeWindow(
+                address=client["address"], width=desired[2], height=desired[3]
+            )
+        )
+        if not result.succeeded:
+            if result.status is MutationStatus.UNAVAILABLE:
                 write_log(
                     "restore: Hyprland IPC failed while resizing tiled windows"
                 )
@@ -2464,7 +3520,7 @@ def restore_tiled_slots(
         resized = True
 
     if resized:
-        clients = compositor.query_json("clients")
+        clients = observed(compositor, ObservationKind.WINDOWS)
         if clients is None:
             write_log("restore: Hyprland IPC failed after resizing tiled windows")
             return None
@@ -2495,13 +3551,11 @@ def restore_tiled_slots(
             if desired == occupant:
                 continue
             other_index = slot_addresses.index(desired)
-            if not compositor.dispatch(
-                "hl.dsp.window.swap({ "
-                f"window = {lua_quote(f'address:{desired}')}, "
-                f"target = {lua_quote(f'address:{occupant}')} "
-                "})"
-            ):
-                if compositor.query_json("clients") is None:
+            result = compositor.apply(
+                SwapWindows(address=desired, target=occupant)
+            )
+            if not result.succeeded:
+                if result.status is MutationStatus.UNAVAILABLE:
                     write_log(
                         "restore: Hyprland IPC failed while correcting tiled slots"
                     )
@@ -2525,7 +3579,7 @@ def restore_tiled_layouts(
     compositor=None,
     write_log=None,
 ):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     write_log = log if write_log is None else write_log
     nested_result = restore_nested_tiled_layouts(
         rows,
@@ -2538,7 +3592,7 @@ def restore_tiled_layouts(
     )
     if nested_result is None:
         return None
-    clients = compositor.query_json("clients")
+    clients = observed(compositor, ObservationKind.WINDOWS)
     if clients is None:
         write_log("restore: Hyprland IPC failed after replaying tiled layouts")
         return None
@@ -2600,6 +3654,41 @@ def mark_restore_completed(sid, complete=True):
                 pass
         try:
             log(f"restore: failed to write completion marker: {error}")
+        except OSError:
+            pass
+        return False
+
+
+def read_current_session_name():
+    try:
+        marker = json.loads(CURRENT_SESSION_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker, dict):
+        return None
+    name = marker.get("name")
+    return name if isinstance(name, str) else None
+
+
+def write_current_session_name(name):
+    temporary = None
+    try:
+        secure_state_storage()
+        with tempfile.NamedTemporaryFile("w", dir=STATE_DIR, delete=False) as handle:
+            json.dump({"name": name}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.replace(temporary, CURRENT_SESSION_PATH)
+        return True
+    except OSError as error:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            log(f"current session: failed to write marker: {error}")
         except OSError:
             pass
         return False
@@ -2739,14 +3828,18 @@ def launch_request(row):
     if row.get("floating"):
         rules.append("float = true")
     rules_str = ", ".join(rules)
-    lua = f"hl.dsp.exec_cmd({lua_quote(command)}, {{ {rules_str} }})"
-    return command, rules_str, lua
+    action = LaunchApplication(
+        command=command,
+        workspace_id=row.get("workspace_id"),
+        floating=bool(row.get("floating")),
+    )
+    return command, rules_str, action
 
 
 def hyprland_supports_group_restore(*, compositor=None, write_log=None):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     write_log = log if write_log is None else write_log
-    version = compositor.query_json("version")
+    version = observed(compositor, ObservationKind.VERSION)
     if version is None:
         return None
     match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", str(version.get("version", "")))
@@ -2776,7 +3869,7 @@ def restore_window_groups(
     compositor=None,
     write_log=None,
 ):
-    compositor = compositor or HyprlandRestoreAdapter()
+    compositor = compositor or ProductionHyprland()
     write_log = log if write_log is None else write_log
     eligible = []
     for group in saved_window_groups(rows):
@@ -2813,7 +3906,7 @@ def restore_window_groups(
         write_log("restore: Hyprland 0.56+ is required to restore window groups")
         return True
 
-    clients = compositor.query_json("clients")
+    clients = observed(compositor, ObservationKind.WINDOWS)
     if clients is None:
         return None
     client_by_address = {
@@ -2844,52 +3937,24 @@ def restore_window_groups(
             write_log("restore: skipping group with ambiguous matched members")
             continue
         grouped = [client.get("grouped") for client in current]
-        if all(value == addresses for value in grouped):
+        if all(tuple(value or ()) == tuple(addresses) for value in grouped):
             continue
-        if any(value not in (None, []) for value in grouped):
+        if any(value for value in grouped):
             write_log("restore: skipping group with conflicting current membership")
             continue
 
-        selectors = [lua_quote(f"address:{address}") for address in addresses]
-        declarations = [
-            f"local w{index}=assert(hl.get_window({selector}), 'group member missing')"
-            for index, selector in enumerate(selectors, 1)
-        ]
-        ungrouped = " and ".join(
-            f"w{index}.group == nil" for index in range(1, len(addresses) + 1)
+        mutation = compositor.apply(
+            RestoreWindowGroup(addresses=addresses)
         )
-        operations = [
-            *declarations,
-            f"assert({ungrouped}, 'group member already grouped')",
-            f"hl.dispatch(hl.dsp.group.toggle({{ window = {selectors[0]} }}))",
-            "local g=assert(w1.group, 'group creation failed')",
-            *(
-                f"g:add(w{index}, g.size + 1)"
-                for index in range(2, len(addresses) + 1)
-            ),
-            *(
-                [
-                    f"hl.dispatch(hl.dsp.group.active({{ index = 1, window = {selectors[0]} }}))"
-                ]
-                if len(addresses) > 1
-                else []
-            ),
-            f"assert(g.size == {len(addresses)}, 'group size mismatch')",
-            *(
-                f"assert(g.members[{index}] == w{index}, 'group order mismatch')"
-                for index in range(1, len(addresses) + 1)
-            ),
-        ]
-        eval_result = compositor.evaluate(" ".join(operations))
-        if eval_result is None:
+        if mutation.status is MutationStatus.UNAVAILABLE:
             return None
-        if not eval_result:
+        if not mutation.succeeded:
             return False
         expected_groups.append(addresses)
 
     if not expected_groups:
         return True
-    clients = compositor.query_json("clients")
+    clients = observed(compositor, ObservationKind.WINDOWS)
     if clients is None:
         return None
     client_by_address = {
@@ -2899,7 +3964,8 @@ def restore_window_groups(
     }
     for addresses in expected_groups:
         if any(
-            client_by_address.get(address, {}).get("grouped") != addresses
+            tuple(client_by_address.get(address, {}).get("grouped") or ())
+            != tuple(addresses)
             for address in addresses
         ):
             write_log("restore: reconstructed window group failed verification")
@@ -2907,293 +3973,35 @@ def restore_window_groups(
     return True
 
 
-def _execute_restore(prepared):
-    rows = prepared._snapshot.windows
-    initial_matches = prepared._initial_matches
-    initial_clients = prepared._initial_clients
-    layouts = prepared._snapshot.workspace_layouts
-    restore_timeout = prepared._settings.timeout_seconds
-    monitor_fallback = prepared._settings.monitor_fallback
-    compositor = prepared._compositor
-    clock = prepared._clock
-    write_log = prepared._write_log
-    row_by_id = {row["id"]: row for row in rows}
-    matches = dict(initial_matches)
-    used_addresses = {
-        client.get("address")
-        for client in initial_clients
-        if client.get("mapped") and client.get("address")
-    }
-    restored = 0
-    failures = 0
-    launched_processes = 0
-    handled = set()
-    placed = set()
-    client_by_address = {
-        client.get("address"): client
-        for client in initial_clients
-        if client.get("address")
-    }
-    monitor_targets, current_monitors, monitor_ipc_failed = (
-        load_workspace_monitor_context(
-            rows,
-            monitor_fallback,
-            compositor=compositor,
-            write_log=write_log,
-        )
+def _production_restore_window_group(addresses):
+    selectors = [lua_quote(f"address:{address}") for address in addresses]
+    declarations = [
+        f"local w{index}=assert(hl.get_window({selector}), 'group member missing')"
+        for index, selector in enumerate(selectors, 1)
+    ]
+    ungrouped = " and ".join(
+        f"w{index}.group == nil" for index in range(1, len(addresses) + 1)
     )
-    if monitor_ipc_failed:
-        return restored, len(rows), launched_processes, True
-    prepared_workspaces = set()
-    failed_monitor_workspaces = set()
-
-    for row_id, address in matches.items():
-        row = row_by_id[row_id]
-        workspace_id = row.get("workspace_id")
-        target = monitor_targets.get(workspace_id)
-        monitor_will_move = (
-            target is not None
-            and workspace_id not in prepared_workspaces
-            and current_monitors.get(workspace_id) != target
-        )
-        monitor_ok = prepare_workspace_monitor(
-            row,
-            address,
-            monitor_targets,
-            current_monitors,
-            prepared_workspaces,
-            compositor=compositor,
-        )
-        if not monitor_ok:
-            failed_monitor_workspaces.add(workspace_id)
-        elif monitor_will_move:
-            clients = compositor.query_json("clients")
-            if clients is None:
-                write_log(
-                    "restore: Hyprland IPC failed after remapping workspace monitors"
-                )
-                return restored, failures + 1, launched_processes, True
-            client_by_address = {
-                client.get("address"): client
-                for client in clients
-                if client.get("address")
-            }
-        if monitor_ok and place_window(
-            row,
-            address,
-            client_by_address.get(address),
-            compositor=compositor,
-        ):
-            restored += 1
-            placed.add(row_id)
-        else:
-            failures += 1
-        handled.add(row_id)
-
-    states = []
-    for group in process_groups(rows):
-        missing = [row for row in group if row["id"] not in matches]
-        if not missing:
-            continue
-        launch_row = process_launch_row(group)
-        state = {
-            "rows": group,
-            "attempts": 0,
-            "max_attempts": len(missing),
-            "next_retry": clock.monotonic(),
-            "launch_row": launch_row,
-        }
-        states.append(state)
-
-        # A partially restored process may still be creating its other windows.
-        if any(row["id"] in matches for row in group):
-            state["next_retry"] = clock.monotonic() + RESTORE_RETRY_DELAY
-            continue
-        _, _, lua = launch_request(launch_row)
-        if compositor.dispatch(
-            lua, failure_context="restore: application launch"
-        ):
-            state["attempts"] = 1
-            state["next_retry"] = clock.monotonic() + RESTORE_RETRY_DELAY
-            launched_processes += 1
-        else:
-            state["attempts"] = state["max_attempts"]
-
-    deadline = clock.monotonic() + restore_timeout
-    while len(handled) < len(rows) and clock.monotonic() < deadline:
-        clients = compositor.query_json("clients")
-        if clients is None:
-            write_log("restore: Hyprland IPC failed while waiting for windows")
-            return (
-                restored,
-                failures + len(rows) - len(handled),
-                launched_processes,
-                True,
-            )
-
-        pending = [row for row in rows if row["id"] not in handled]
-        found = match_windows(pending, clients, used_addresses, max_rank=3)
-        client_by_address = {
-            client.get("address"): client for client in clients if client.get("address")
-        }
-        for row_id, address in found.items():
-            matches[row_id] = address
-            used_addresses.add(address)
-            row = row_by_id[row_id]
-            workspace_id = row.get("workspace_id")
-            target = monitor_targets.get(workspace_id)
-            monitor_will_move = (
-                target is not None
-                and workspace_id not in prepared_workspaces
-                and current_monitors.get(workspace_id) != target
-            )
-            monitor_ok = prepare_workspace_monitor(
-                row,
-                address,
-                monitor_targets,
-                current_monitors,
-                prepared_workspaces,
-                compositor=compositor,
-            )
-            if not monitor_ok:
-                failed_monitor_workspaces.add(workspace_id)
-            elif monitor_will_move:
-                clients = compositor.query_json("clients")
-                if clients is None:
-                    write_log(
-                        "restore: Hyprland IPC failed after remapping workspace monitors"
-                    )
-                    return restored, failures + 1, launched_processes, True
-                client_by_address = {
-                    client.get("address"): client
-                    for client in clients
-                    if client.get("address")
-                }
-            if monitor_ok and place_window(
-                row,
-                address,
-                client_by_address.get(address),
-                compositor=compositor,
-            ):
-                restored += 1
-                placed.add(row_id)
-            else:
-                failures += 1
-            handled.add(row_id)
-
-        # A complete workspace can be corrected while unrelated applications
-        # are still starting, rather than waiting for the restore-wide deadline.
-        if found and len(handled) < len(rows) and any(
-            not row.get("floating") and saved_geometry(row) is not None
-            for row in rows
-        ):
-            tiled_result = restore_tiled_layouts(
-                rows,
-                matches,
-                clients,
-                layouts or {},
-                compositor=compositor,
-                write_log=write_log,
-            )
-            if tiled_result is None:
-                write_log(
-                    "restore: Hyprland IPC failed while replaying tiled layouts"
-                )
-                return restored, failures, launched_processes, True
-            if not tiled_result:
-                failures += 1
-
-        now = clock.monotonic()
-        for state in states:
-            missing = [row for row in state["rows"] if row["id"] not in handled]
-            if (
-                missing
-                and state["attempts"] < state["max_attempts"]
-                and now >= state["next_retry"]
-            ):
-                _, _, lua = launch_request(state["launch_row"])
-                if compositor.dispatch(
-                    lua, failure_context="restore: application launch"
-                ):
-                    launched_processes += 1
-                    state["attempts"] += 1
-                    state["next_retry"] = now + RESTORE_RETRY_DELAY
-                else:
-                    state["attempts"] = state["max_attempts"]
-
-        if len(handled) < len(rows):
-            clock.sleep(RESTORE_POLL_INTERVAL)
-
-    for row in rows:
-        if row["id"] not in handled:
-            failures += 1
-            write_log(f"restore: no window appeared for {row['class']}")
-    focus_context = load_focus_context(compositor=compositor)
-    if focus_context is None:
-        write_log(
-            "restore: Hyprland IPC failed while recording focus; "
-            "tiled/group correction will still run"
-        )
-        failures += 1
-    if any(not row.get("floating") and saved_geometry(row) is not None for row in rows):
-        clients = compositor.query_json("clients")
-        if clients is None:
-            write_log("restore: Hyprland IPC failed while correcting tiled slots")
-            return restored, failures, launched_processes, True
-        tiled_matches = {
-            row_id: address
-            for row_id, address in matches.items()
-            if row_by_id[row_id].get("workspace_id") not in failed_monitor_workspaces
-        }
-        tiled_result = restore_tiled_layouts(
-            rows,
-            tiled_matches,
-            clients,
-            layouts or {},
-            focus_context,
-            compositor=compositor,
-            write_log=write_log,
-        )
-        if tiled_result is None:
-            write_log("restore: Hyprland IPC failed while replaying tiled layouts")
-            return restored, failures, launched_processes, True
-        if not tiled_result:
-            failures += 1
-    floating_result = verify_floating_placements(
-        rows,
-        {row_id: matches[row_id] for row_id in placed},
-        compositor=compositor,
-        clock=clock,
-        write_log=write_log,
-    )
-    if floating_result is None:
-        write_log("restore: Hyprland IPC failed while verifying floating geometry")
-        return restored, failures, launched_processes, True
-    if not floating_result:
-        failures += 1
-    group_result = restore_window_groups(
-        rows,
-        matches,
-        failed_monitor_workspaces,
-        compositor=compositor,
-        write_log=write_log,
-    )
-    if group_result is None:
-        write_log("restore: Hyprland IPC failed while restoring window groups")
-        return restored, failures, launched_processes, True
-    if not group_result:
-        failures += 1
-    if focus_context is not None:
-        focus_result = restore_focus_context(
-            focus_context, compositor=compositor
-        )
-        if focus_result is None:
-            write_log("restore: Hyprland IPC failed while restoring focus")
-            return restored, failures, launched_processes, True
-        if not focus_result:
-            write_log("restore: failed to restore the previously focused workspace")
-            failures += 1
-    return restored, failures, launched_processes, False
+    operations = [
+        *declarations,
+        f"assert({ungrouped}, 'group member already grouped')",
+        f"hl.dispatch(hl.dsp.group.toggle({{ window = {selectors[0]} }}))",
+        "local g=assert(w1.group, 'group creation failed')",
+        *(f"g:add(w{index}, g.size + 1)" for index in range(2, len(addresses) + 1)),
+        *(
+            [
+                f"hl.dispatch(hl.dsp.group.active({{ index = 1, window = {selectors[0]} }}))"
+            ]
+            if len(addresses) > 1
+            else []
+        ),
+        f"assert(g.size == {len(addresses)}, 'group size mismatch')",
+        *(
+            f"assert(g.members[{index}] == w{index}, 'group order mismatch')"
+            for index in range(1, len(addresses) + 1)
+        ),
+    ]
+    return " ".join(operations)
 
 
 @dataclass(frozen=True)
@@ -3204,61 +4012,103 @@ class RestoreOutcome:
     retryable_failure: bool
 
 
-class PreparedRestore:
+@dataclass(frozen=True)
+class RestorePreviewEntry:
+    class_name: str
+    command: str
+    rules: str
+    maximum_launches: int
+
+
+@dataclass(frozen=True)
+class RestorePreview:
+    entries: tuple
+    maximum_processes: int
+
+    def __post_init__(self):
+        object.__setattr__(self, "entries", tuple(self.entries))
+
+
+class RestoreRun:
+    """An immutable prepared restore plan that can execute once."""
+
     __slots__ = (
         "_clock",
         "_compositor",
         "_executed",
         "_initial_clients",
         "_initial_matches",
+        "_launch_groups",
+        "_preview",
         "_settings",
+        "_sealed",
         "_snapshot",
         "_write_log",
     )
 
-    def __init__(
-        self,
+    def __init__(self, *_args, **_kwargs):
+        raise TypeError("use RestoreRun.prepare()")
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False) and name != "_executed":
+            raise AttributeError("a prepared Restore run is immutable")
+        object.__setattr__(self, name, value)
+
+    @classmethod
+    def prepare(
+        cls,
         snapshot,
         settings,
-        initial_matches,
-        initial_clients,
-        compositor,
-        clock,
-        write_log,
+        *,
+        compositor=None,
+        clock=None,
+        write_log=None,
     ):
-        self._snapshot = snapshot
-        self._settings = settings
-        self._initial_matches = initial_matches
-        self._initial_clients = initial_clients
-        self._compositor = compositor
-        self._clock = clock
-        self._write_log = write_log
-        self._executed = False
-
-    def preview(self):
-        launches = []
+        compositor = compositor or ProductionHyprland(write_log=write_log)
+        initial_clients = observed(compositor, ObservationKind.WINDOWS)
+        if initial_clients is None:
+            return None
+        initial_matches = MappingProxyType(
+            match_windows(snapshot.windows, initial_clients, max_rank=2)
+        )
+        launch_groups = tuple(tuple(group) for group in process_groups(snapshot.windows))
+        entries = []
         maximum_processes = 0
-        for group in process_groups(self._snapshot.windows):
-            missing = [
-                row for row in group if row["id"] not in self._initial_matches
-            ]
+        for group in launch_groups:
+            missing = [row for row in group if row["id"] not in initial_matches]
             if not missing:
                 continue
             command, rules, _ = launch_request(process_launch_row(group))
-            launches.append((group[0]["class"], command, rules, len(missing)))
+            entries.append(
+                RestorePreviewEntry(
+                    group[0]["class"], command, rules, len(missing)
+                )
+            )
             maximum_processes += len(missing)
-        return tuple(launches), maximum_processes
+
+        self = object.__new__(cls)
+        self._snapshot = snapshot
+        self._settings = settings
+        self._initial_matches = initial_matches
+        self._initial_clients = tuple(initial_clients)
+        self._launch_groups = launch_groups
+        self._preview = RestorePreview(tuple(entries), maximum_processes)
+        self._compositor = compositor
+        self._clock = clock or SystemClockAdapter()
+        self._write_log = log if write_log is None else write_log
+        self._executed = False
+        self._sealed = True
+        return self
+
+    def preview(self):
+        return self._preview
 
     def execute(self):
         if self._executed:
             raise RuntimeError("a prepared Restore run can execute only once")
         self._executed = True
-        with animations_disabled(
-            compositor=self._compositor, write_log=self._write_log
-        ):
-            restored, failures, launched_processes, retryable_failure = (
-                _execute_restore(self)
-            )
+        with self._compositor.mutations():
+            restored, failures, launched_processes, retryable_failure = self._execute_once()
         return RestoreOutcome(
             restored_windows=restored,
             permanent_failures=failures,
@@ -3266,48 +4116,309 @@ class PreparedRestore:
             retryable_failure=retryable_failure,
         )
 
-
-class RestoreObservation:
-    __slots__ = ("_clients", "_runner")
-
-    def __init__(self, runner, clients):
-        self._runner = runner
-        self._clients = clients
-
-    def prepare(self, snapshot, settings):
-        initial_matches = match_windows(snapshot.windows, self._clients, max_rank=2)
-        return PreparedRestore(
-            snapshot,
-            settings,
-            initial_matches,
-            self._clients,
-            self._runner._compositor,
-            self._runner._clock,
-            self._runner._write_log,
+    def _execute_once(self):
+        rows = self._snapshot.windows
+        initial_matches = self._initial_matches
+        initial_clients = self._initial_clients
+        layouts = self._snapshot.workspace_layouts
+        restore_timeout = self._settings.timeout_seconds
+        monitor_fallback = self._settings.monitor_fallback
+        compositor = self._compositor
+        clock = self._clock
+        write_log = self._write_log
+        row_by_id = {row["id"]: row for row in rows}
+        matches = dict(initial_matches)
+        used_addresses = {
+            client.get("address")
+            for client in initial_clients
+            if client.get("mapped") and client.get("address")
+        }
+        restored = 0
+        failures = 0
+        launched_processes = 0
+        handled = set()
+        placed = set()
+        client_by_address = {
+            client.get("address"): client
+            for client in initial_clients
+            if client.get("address")
+        }
+        monitor_targets, current_monitors, monitor_ipc_failed = (
+            load_workspace_monitor_context(
+                rows,
+                monitor_fallback,
+                compositor=compositor,
+                write_log=write_log,
+            )
         )
+        if monitor_ipc_failed:
+            return restored, len(rows), launched_processes, True
+        prepared_workspaces = set()
+        failed_monitor_workspaces = set()
 
+        for row_id, address in matches.items():
+            row = row_by_id[row_id]
+            workspace_id = row.get("workspace_id")
+            target = monitor_targets.get(workspace_id)
+            monitor_will_move = (
+                target is not None
+                and workspace_id not in prepared_workspaces
+                and current_monitors.get(workspace_id) != target
+            )
+            monitor_result = prepare_workspace_monitor(
+                row,
+                address,
+                monitor_targets,
+                current_monitors,
+                prepared_workspaces,
+                compositor=compositor,
+            )
+            if monitor_result.status is MutationStatus.UNAVAILABLE:
+                return restored, failures, launched_processes, True
+            monitor_ok = monitor_result.succeeded
+            if not monitor_ok:
+                failed_monitor_workspaces.add(workspace_id)
+            elif monitor_will_move:
+                client_by_address = {
+                    client.get("address"): client
+                    for client in monitor_result.refreshed_windows
+                    if client.get("address")
+                }
+            placement = (
+                place_window(
+                    row,
+                    address,
+                    client_by_address.get(address),
+                    compositor=compositor,
+                )
+                if monitor_ok
+                else MutationResult(MutationStatus.REJECTED)
+            )
+            if placement.status is MutationStatus.UNAVAILABLE:
+                return restored, failures, launched_processes, True
+            if placement.succeeded:
+                restored += 1
+                placed.add(row_id)
+            else:
+                failures += 1
+            handled.add(row_id)
 
-class RestoreRun:
-    """Observe and prepare one selected Snapshot for a Restore run."""
+        states = []
+        for group in self._launch_groups:
+            missing = [row for row in group if row["id"] not in matches]
+            if not missing:
+                continue
+            launch_row = process_launch_row(group)
+            state = {
+                "rows": group,
+                "attempts": 0,
+                "max_attempts": len(missing),
+                "next_retry": clock.monotonic(),
+                "launch_row": launch_row,
+            }
+            states.append(state)
 
-    __slots__ = ("_clock", "_compositor", "_write_log")
+            # A partially restored process may still be creating its other windows.
+            if any(row["id"] in matches for row in group):
+                state["next_retry"] = clock.monotonic() + RESTORE_RETRY_DELAY
+                continue
+            _, _, action = launch_request(launch_row)
+            launch = compositor.apply(action)
+            if launch.succeeded:
+                state["attempts"] = 1
+                state["next_retry"] = clock.monotonic() + RESTORE_RETRY_DELAY
+                launched_processes += 1
+            elif launch.status is MutationStatus.UNAVAILABLE:
+                return restored, failures + len(rows) - len(handled), launched_processes, True
+            else:
+                state["attempts"] = state["max_attempts"]
 
-    def __init__(self, compositor=None, clock=None, write_log=None):
-        self._write_log = log if write_log is None else write_log
-        self._compositor = compositor or HyprlandRestoreAdapter(
-            write_log=write_log
+        deadline = clock.monotonic() + restore_timeout
+        while len(handled) < len(rows) and clock.monotonic() < deadline:
+            clients = observed(compositor, ObservationKind.WINDOWS)
+            if clients is None:
+                write_log("restore: Hyprland IPC failed while waiting for windows")
+                return (
+                    restored,
+                    failures + len(rows) - len(handled),
+                    launched_processes,
+                    True,
+                )
+
+            pending = [row for row in rows if row["id"] not in handled]
+            found = match_windows(pending, clients, used_addresses, max_rank=3)
+            client_by_address = {
+                client.get("address"): client for client in clients if client.get("address")
+            }
+            for row_id, address in found.items():
+                matches[row_id] = address
+                used_addresses.add(address)
+                row = row_by_id[row_id]
+                workspace_id = row.get("workspace_id")
+                target = monitor_targets.get(workspace_id)
+                monitor_will_move = (
+                    target is not None
+                    and workspace_id not in prepared_workspaces
+                    and current_monitors.get(workspace_id) != target
+                )
+                monitor_result = prepare_workspace_monitor(
+                    row,
+                    address,
+                    monitor_targets,
+                    current_monitors,
+                    prepared_workspaces,
+                    compositor=compositor,
+                )
+                if monitor_result.status is MutationStatus.UNAVAILABLE:
+                    return restored, failures, launched_processes, True
+                monitor_ok = monitor_result.succeeded
+                if not monitor_ok:
+                    failed_monitor_workspaces.add(workspace_id)
+                elif monitor_will_move:
+                    clients = monitor_result.refreshed_windows
+                    client_by_address = {
+                        client.get("address"): client
+                        for client in clients
+                        if client.get("address")
+                    }
+                placement = (
+                    place_window(
+                        row,
+                        address,
+                        client_by_address.get(address),
+                        compositor=compositor,
+                    )
+                    if monitor_ok
+                    else MutationResult(MutationStatus.REJECTED)
+                )
+                if placement.status is MutationStatus.UNAVAILABLE:
+                    return restored, failures, launched_processes, True
+                if placement.succeeded:
+                    restored += 1
+                    placed.add(row_id)
+                else:
+                    failures += 1
+                handled.add(row_id)
+
+            # A complete workspace can be corrected while unrelated applications
+            # are still starting, rather than waiting for the restore-wide deadline.
+            if found and len(handled) < len(rows) and any(
+                not row.get("floating") and saved_geometry(row) is not None
+                for row in rows
+            ):
+                tiled_result = restore_tiled_layouts(
+                    rows,
+                    matches,
+                    clients,
+                    layouts or {},
+                    compositor=compositor,
+                    write_log=write_log,
+                )
+                if tiled_result is None:
+                    write_log(
+                        "restore: Hyprland IPC failed while replaying tiled layouts"
+                    )
+                    return restored, failures, launched_processes, True
+                if not tiled_result:
+                    failures += 1
+
+            now = clock.monotonic()
+            for state in states:
+                missing = [row for row in state["rows"] if row["id"] not in handled]
+                if (
+                    missing
+                    and state["attempts"] < state["max_attempts"]
+                    and now >= state["next_retry"]
+                ):
+                    _, _, action = launch_request(state["launch_row"])
+                    launch = compositor.apply(action)
+                    if launch.succeeded:
+                        launched_processes += 1
+                        state["attempts"] += 1
+                        state["next_retry"] = now + RESTORE_RETRY_DELAY
+                    elif launch.status is MutationStatus.UNAVAILABLE:
+                        return (
+                            restored,
+                            failures + len(rows) - len(handled),
+                            launched_processes,
+                            True,
+                        )
+                    else:
+                        state["attempts"] = state["max_attempts"]
+
+            if len(handled) < len(rows):
+                clock.sleep(RESTORE_POLL_INTERVAL)
+
+        for row in rows:
+            if row["id"] not in handled:
+                failures += 1
+                write_log(f"restore: no window appeared for {row['class']}")
+        focus_context = load_focus_context(compositor=compositor)
+        retryable_failure = focus_context is None
+        if focus_context is None:
+            write_log(
+                "restore: Hyprland IPC failed while recording focus; "
+                "tiled/group correction will still run"
+            )
+        if any(not row.get("floating") and saved_geometry(row) is not None for row in rows):
+            clients = observed(compositor, ObservationKind.WINDOWS)
+            if clients is None:
+                write_log("restore: Hyprland IPC failed while correcting tiled slots")
+                return restored, failures, launched_processes, True
+            tiled_matches = {
+                row_id: address
+                for row_id, address in matches.items()
+                if row_by_id[row_id].get("workspace_id") not in failed_monitor_workspaces
+            }
+            tiled_result = restore_tiled_layouts(
+                rows,
+                tiled_matches,
+                clients,
+                layouts or {},
+                focus_context,
+                compositor=compositor,
+                write_log=write_log,
+            )
+            if tiled_result is None:
+                write_log("restore: Hyprland IPC failed while replaying tiled layouts")
+                return restored, failures, launched_processes, True
+            if not tiled_result:
+                failures += 1
+        floating_result = verify_floating_placements(
+            rows,
+            {row_id: matches[row_id] for row_id in placed},
+            compositor=compositor,
+            clock=clock,
+            write_log=write_log,
         )
-        self._clock = clock or SystemClockAdapter()
-
-    def observe(self):
-        clients = self._compositor.query_json("clients")
-        if clients is None:
-            return None
-        return RestoreObservation(self, clients)
-
-    def prepare(self, snapshot, settings):
-        observation = self.observe()
-        return None if observation is None else observation.prepare(snapshot, settings)
+        if floating_result is None:
+            write_log("restore: Hyprland IPC failed while verifying floating geometry")
+            return restored, failures, launched_processes, True
+        if not floating_result:
+            failures += 1
+        group_result = restore_window_groups(
+            rows,
+            matches,
+            failed_monitor_workspaces,
+            compositor=compositor,
+            write_log=write_log,
+        )
+        if group_result is None:
+            write_log("restore: Hyprland IPC failed while restoring window groups")
+            return restored, failures, launched_processes, True
+        if not group_result:
+            failures += 1
+        if focus_context is not None:
+            focus_result = restore_focus_context(
+                focus_context, compositor=compositor
+            )
+            if focus_result is None:
+                write_log("restore: Hyprland IPC failed while restoring focus")
+                return restored, failures, launched_processes, True
+            if not focus_result:
+                write_log("restore: failed to restore the previously focused workspace")
+                failures += 1
+        return restored, failures, launched_processes, retryable_failure
 
 
 def cmd_restore(dry_run=False, name=None):
@@ -3319,31 +4430,36 @@ def cmd_restore(dry_run=False, name=None):
         print("restore deferred: another session operation is running")
         return 75
     try:
-        conn = db_conn()
-        sess = named_session(conn, name) if name is not None else latest_session(conn)
-        if sess is None:
+        try:
+            snapshot = SnapshotHistory().select(name=name)
+        except SnapshotHistoryError as error:
+            print(f"snapshot history error: {error}", file=sys.stderr)
+            return 75 if error.retryable else 1
+        if snapshot is None:
             if name is not None:
                 print(f"no saved session named {name!r}", file=sys.stderr)
-                conn.close()
                 return 1
             print("no saved session to restore")
-            conn.close()
             if (
                 not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
-                or hyprctl_json("clients") is None
+                or observed(ProductionHyprland(), ObservationKind.WINDOWS) is None
             ):
                 print("restore deferred: Hyprland IPC is unavailable", file=sys.stderr)
                 return 75
             return 0 if dry_run or mark_restore_completed(None) else 75
-        sid, _, _ = sess
+        sid = snapshot.session_id
         if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
             print("restore failed: Hyprland IPC is unavailable", file=sys.stderr)
-            conn.close()
             return 75
-        observation = RestoreRun().observe()
-        if observation is None:
+        prepared = RestoreRun.prepare(
+            snapshot,
+            RestoreSettings(
+                timeout_seconds=cfg["restore_timeout_seconds"],
+                monitor_fallback=cfg["monitor_fallback"],
+            ),
+        )
+        if prepared is None:
             print("restore failed: Hyprland IPC is unavailable", file=sys.stderr)
-            conn.close()
             return 75
         if name is None and restore_was_completed(sid):
             print(
@@ -3351,36 +4467,27 @@ def cmd_restore(dry_run=False, name=None):
                 if name is not None
                 else "restore skipped: session already handled for this desktop"
             )
-            conn.close()
             return 0
-        rows = load_windows(conn, sid)
+        rows = snapshot.windows
         if not rows:
-            conn.close()
             print("saved session is empty; nothing to restore")
-            return 0 if dry_run or mark_restore_completed(sid) else 75
-        layouts = load_workspace_layouts(conn, sid)
-        snapshot = Snapshot(sid, rows, layouts)
-        prepared = observation.prepare(
-            snapshot,
-            RestoreSettings(
-                timeout_seconds=cfg["restore_timeout_seconds"],
-                monitor_fallback=cfg["monitor_fallback"],
-            ),
-        )
+            if dry_run:
+                return 0
+            if not mark_restore_completed(sid):
+                return 75
+            write_current_session_name(name)
+            return 0
         if dry_run:
-            launches, launched_processes = prepared.preview()
-            for class_name, launch_cmd, rules_str, maximum_launches in launches:
+            preview = prepared.preview()
+            for entry in preview.entries:
                 print(
-                    f"[dry-run] {class_name}: {launch_cmd}  "
-                    f"rules={{ {rules_str} }}  launches<= {maximum_launches}"
+                    f"[dry-run] {entry.class_name}: {entry.command}  "
+                    f"rules={{ {entry.rules} }}  launches<= {entry.maximum_launches}"
                 )
             print(
-                f"would launch up to {launched_processes} processes for {len(rows)} windows"
+                f"would launch up to {preview.maximum_processes} processes for {len(rows)} windows"
             )
-            conn.close()
             return 0
-
-        conn.close()
 
         if not mark_restore_completed(sid, complete=False):
             print("restore deferred: could not persist restore state", file=sys.stderr)
@@ -3397,7 +4504,10 @@ def cmd_restore(dry_run=False, name=None):
             return 75
         if outcome.permanent_failures:
             return 1
-        return 0 if mark_restore_completed(sid) else 75
+        if not mark_restore_completed(sid):
+            return 75
+        write_current_session_name(name)
+        return 0
     finally:
         lock_file.close()
 
@@ -3418,30 +4528,23 @@ def cmd_autosave(interval=None):
 
 
 def cmd_status():
-    conn = db_conn()
-    for sid, label, created, capture_status in conn.execute(
-        "SELECT id, label, created_at, capture_status FROM sessions ORDER BY id DESC LIMIT 5"
-    ):
-        n = conn.execute(
-            "SELECT COUNT(*) FROM windows WHERE session = ?", (sid,)
-        ).fetchone()[0]
-        print(f"session {sid} [{label}] {created}: {n} windows ({capture_status})")
-    conn.close()
+    for snapshot in SnapshotHistory().recent():
+        print(
+            f"session {snapshot.session_id} [{snapshot.label}] {snapshot.created_at}: "
+            f"{snapshot.window_count} windows ({snapshot.capture_status})"
+        )
 
 
 def cmd_list(as_json=False):
-    conn = db_conn()
-    sessions = []
-    for name, sid, created, windows in conn.execute(
-        "SELECT n.name, s.id, s.created_at, COUNT(w.id) FROM named_sessions n "
-        "JOIN sessions s ON s.id = n.session "
-        "LEFT JOIN windows w ON w.session = s.id "
-        "GROUP BY n.name, s.id, s.created_at ORDER BY n.name COLLATE BINARY"
-    ):
-        sessions.append(
-            {"name": name, "id": sid, "created_at": created, "windows": windows}
-        )
-    conn.close()
+    sessions = [
+        {
+            "name": snapshot.name,
+            "id": snapshot.session_id,
+            "created_at": snapshot.created_at,
+            "windows": snapshot.window_count,
+        }
+        for snapshot in SnapshotHistory().list_named()
+    ]
     if as_json:
         print(json.dumps(sessions, ensure_ascii=False))
     else:
@@ -3460,25 +4563,16 @@ def cmd_delete(name):
         print("delete deferred: another session operation is running")
         return 75
     try:
-        conn = db_conn()
-        missing = False
-        with conn:
-            row = conn.execute(
-                "SELECT session FROM named_sessions WHERE name = ?", (name,)
-            ).fetchone()
-            if row is None:
-                missing = True
-            else:
-                sid = row[0]
-                conn.execute("DELETE FROM named_sessions WHERE name = ?", (name,))
-                conn.execute("DELETE FROM workspace_layouts WHERE session = ?", (sid,))
-                conn.execute("DELETE FROM windows WHERE session = ?", (sid,))
-                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-        conn.close()
-        if missing:
+        deleted = SnapshotHistory().delete_named(name)
+        if deleted is None:
             print(f"no saved session named {name!r}", file=sys.stderr)
             return 1
-        log(f"delete: removed named session {name!r} (session {sid})")
+        if read_current_session_name() == name:
+            write_current_session_name(None)
+        log(
+            f"delete: removed named session {name!r} "
+            f"(session {deleted.session_id})"
+        )
         print(f"deleted named session {name!r}")
         return 0
     finally:
@@ -3492,15 +4586,12 @@ def acceptance_result(ok, message):
 
 def acceptance_session(marker):
     try:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-        session = conn.execute(
-            "SELECT label, capture_status FROM sessions WHERE id = ?", (marker["session"],)
-        ).fetchone()
-        rows = load_windows(conn, marker["session"])
-        conn.close()
-    except (KeyError, OSError, sqlite3.Error):
+        snapshot = SnapshotHistory(read_only=True).select(session_id=marker["session"])
+    except (KeyError, SnapshotHistoryError):
         return None, []
-    return session, rows
+    if snapshot is None:
+        return None, []
+    return (snapshot.label, snapshot.capture_status), snapshot.windows
 
 
 def systemd_unit_active(unit):
@@ -3518,7 +4609,7 @@ def systemd_unit_failed(unit):
 
 
 def cmd_acceptance(expect_power_save=False, expect_restore_failure=False):
-    """Report read-only evidence for a deliberate live reboot acceptance run."""
+    """Report live reboot evidence; startup may maintain state permissions/schema."""
     instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     restore_ok = (
         systemd_unit_failed("omarchy-sesh.service")
@@ -3555,7 +4646,7 @@ def cmd_acceptance(expect_power_save=False, expect_restore_failure=False):
         )
     if expect_restore_failure or not session_complete:
         return 0 if all(checks) else 1
-    clients = hyprctl_json("clients")
+    clients = observed(ProductionHyprland(), ObservationKind.WINDOWS)
     matches = match_windows(rows, clients or []) if clients is not None else {}
     checks.append(acceptance_result(clients is not None, "Hyprland clients are readable"))
     checks.append(
@@ -3565,7 +4656,7 @@ def cmd_acceptance(expect_power_save=False, expect_restore_failure=False):
     return 0 if all(checks) else 1
 
 
-def cmd_mode(mode=None):
+def cmd_mode(mode=None, as_json=False):
     if mode is None:
         result = subprocess.run(
             ["systemctl", "--user", "is-enabled", AUTOSAVE_UNIT],
@@ -3574,7 +4665,10 @@ def cmd_mode(mode=None):
             check=False,
         )
         if result.returncode == 0:
-            print("active")
+            if as_json:
+                print(json.dumps({"mode": "active", "name": read_current_session_name()}))
+            else:
+                print("active")
             state = subprocess.run(
                 ["systemctl", "--user", "is-active", AUTOSAVE_UNIT],
                 capture_output=True,
@@ -3590,7 +4684,10 @@ def cmd_mode(mode=None):
                 )
             return 0
         if result.stdout.strip() == "disabled":
-            print("manual")
+            if as_json:
+                print(json.dumps({"mode": "manual", "name": read_current_session_name()}))
+            else:
+                print("manual")
             return 0
         print(
             result.stderr.strip() or "autosave service is not installed",
@@ -3599,7 +4696,11 @@ def cmd_mode(mode=None):
         return result.returncode or 1
 
     if mode == "active" and not restore_is_ready():
-        result = cmd_save("manual", wait=True)
+        if as_json:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = cmd_save("manual", wait=True)
+        else:
+            result = cmd_save("manual", wait=True)
         if result != 0:
             print(
                 "failed to capture the current session before enabling autosave",
@@ -3620,7 +4721,10 @@ def cmd_mode(mode=None):
     if result.returncode != 0:
         print(result.stderr.strip() or f"failed to set {mode} mode", file=sys.stderr)
         return result.returncode
-    print(mode)
+    if as_json:
+        print(json.dumps({"mode": mode, "name": read_current_session_name()}))
+    else:
+        print(mode)
     return 0
 
 
@@ -3657,13 +4761,14 @@ def main():
     p_delete.add_argument("--name", required=True, type=argparse_session_name)
 
     p_acceptance = sub.add_parser(
-        "acceptance", help="report read-only evidence for a live reboot acceptance run"
+        "acceptance", help="report evidence for a live reboot acceptance run"
     )
     p_acceptance.add_argument("--expect-power-save", action="store_true")
     p_acceptance.add_argument("--expect-restore-failure", action="store_true")
 
     p_mode = sub.add_parser("mode", help="get or set autosave mode")
     p_mode.add_argument("mode", nargs="?", choices=("active", "manual"))
+    p_mode.add_argument("--json", action="store_true", help="emit JSON for the query form")
 
     args = parser.parse_args()
     try:
@@ -3687,10 +4792,13 @@ def main():
                 expect_restore_failure=args.expect_restore_failure,
             )
         if args.command == "mode":
-            return cmd_mode(args.mode)
+            return cmd_mode(args.mode, as_json=args.json)
     except ConfigError as e:
         print(f"configuration error: {e}", file=sys.stderr)
         return 2
+    except SnapshotHistoryError as e:
+        print(f"snapshot history error: {e}", file=sys.stderr)
+        return 75 if e.retryable else 1
     parser.print_help()
     return 1
 

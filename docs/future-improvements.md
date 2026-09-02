@@ -9,11 +9,15 @@
       autosave is active when enabled, and neither service enters a restart
       loop.
 - [ ] **Omarchy plugin**: load the widget in the live shell, inspect both shield
-      states, and exercise Active, Manual, and Restore.
+      states, exercise Active, Manual, and the flipped Restore list, and verify
+      the current-session label plus confirmed pointer and keyboard deletion.
+      Automated source-contract coverage does not complete this live QML item.
 - [ ] **Power menu**: confirm Omarchy logout, reboot, and shutdown actions save
       before Hyprland destroys its clients.
 - [ ] **Failure recovery**: force one application launch to fail and confirm
-      autosave does not replace the last complete snapshot.
+      autosave does not replace the last complete Snapshot. Separately force a
+      transient observation/action failure and confirm exit 75 permits retry,
+      while a rejected permanent action exits 1 without a restart loop.
 
 ## Restore Quality
 
@@ -77,7 +81,10 @@
       autosave interval, restore timeout, snapshot retention, and monitor
       fallback. Preserve existing defaults when extending configuration.
 - [ ] **Upgrade coverage**: test plugin upgrades from each released schema and
-      manifest version while preserving Manual mode and existing snapshots.
+      manifest version while preserving Manual mode and existing Snapshots.
+      An automated schema-v6 upgrade fixture covers in-place migration through
+      Snapshot history; the release-to-release matrix and owner-only
+      current-session marker repair still require broader upgrade coverage.
 
 ## Release Readiness
 

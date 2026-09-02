@@ -9,8 +9,9 @@ pixel-exact; tiled geometry is best-effort because Hyprland does not expose its
 split tree. Application content such as tabs, unsaved files, and terminal
 sessions remains the application's responsibility.
 
-The project is also an Omarchy `bar-widget` plugin. Its panel provides exactly
-three user actions: Active autosave, Manual save, and Restore.
+The project is also an Omarchy `bar-widget` plugin. Its panel provides three
+primary actions: Active autosave, Manual save, and Restore. Restore flips the
+panel to the named-session list, where each row restores or deletes one session.
 
 Read `README.md` for user-facing behavior and
 `docs/session-restore-spec.md` for the detailed design and verified Hyprland API.
@@ -18,8 +19,20 @@ Read `README.md` for user-facing behavior and
 ## Architecture
 
 - `bin/omarchy-sesh`: the application. This is one Python 3 script using only
-  the standard library. It owns configuration, SQLite migrations, capture,
-  matching, process launch, placement, autosave, status, and mode control.
+  the standard library. Snapshot history and Restore run are its deep modules;
+  the save, restore, and autosave command paths retain configuration loading,
+  while commands retain locking, markers, output, and exit translation.
+- Snapshot history owns the SQLite seam: schema migration, transactions,
+  selection, retention, naming/deletion, and storage error classification. It
+  returns immutable Snapshots with snapshot-local window order identity.
+- Restore run owns one immutable prepared plan, repeatable preview, single-use
+  execution, matching, concurrent launch scheduling, placement, correction,
+  verification, and outcome construction.
+- `ProductionHyprland` and `DeterministicHyprland` are adapters for one semantic
+  capture/observation/action/result interface. Lua, selectors, redaction,
+  monitor refresh, and animation lifetime stay local to the production adapter;
+  deterministic state, queued results, replay modeling, and event order stay
+  local to tests. This seam gives tests leverage without leaking IPC details.
 - `Panel.qml`: Omarchy shell panel and the three-action UI.
 - `Service.qml`: installation checks and asynchronous CLI process orchestration
   for the panel.
@@ -60,21 +73,35 @@ service's `ExecStop` capture is diagnostic fallback only.
 - Database: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`
 - Operation lock: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.lock`
 - Restore marker: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/restore-complete.json`
+- Current-session marker: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current-session.json`
 - Log: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/log/omarchy-sesh.log`
 - Optional config: `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
 - Installed CLI: `~/.local/bin/omarchy-sesh`
 
 The validated configuration supports `exclude_classes`, `autosave_seconds`,
 `restore_timeout_seconds`, `snapshot_retention`, and `monitor_fallback`. Do not
-assume paths under `$HOME` when an XDG override is available.
+assume paths under `$HOME` when an XDG override is available. Only `save`,
+`restore`, and `autosave` load the configuration.
 
 ## Correctness Invariants
 
 - A healthy complete empty snapshot is authoritative. Partial, failed,
   teardown, and ambiguous legacy snapshots must never supersede a complete one.
 - Save and restore operations must hold the advisory operation lock. Exit 75
-  means a temporary condition that systemd may retry; exit 1 represents an
-  application or placement failure and intentionally prevents a relaunch loop.
+  means a temporary storage, capture, focus, placement, monitor, replay, lock,
+  critical restore-complete marker, or IPC condition that systemd may retry.
+  Exit 1 represents a permanent failure and intentionally prevents a relaunch
+  loop.
+- Keep Snapshot history deep: callers provide captures or selection criteria,
+  not SQL. Schema migration, transaction boundaries, retention, naming, and
+  storage error classification remain local to the module.
+- Keep the Hyprland interface semantic and typed. `UNAVAILABLE` is retryable;
+  `REJECTED` is permanent. Lua encoding, selectors, redaction, monitor refresh,
+  and animation suppression belong to the production adapter.
+- A prepared Restore run is immutable, previewable repeatedly, and executable
+  once. It owns the shared deadline, concurrent launch ordering, and current
+  placement/correction order; commands own locks, markers, output, and exit
+  translation.
 - Window matching is one-to-one. Never deduplicate only by class, and never
   claim an unrelated pre-existing client while discovering launched windows.
 - Launch grouping follows saved PID, except strict Chromium web-app rows. Launch
@@ -91,6 +118,10 @@ assume paths under `$HOME` when an XDG override is available.
   creates duplicate-restore races.
 - The restore-complete marker is scoped to the compositor instance. Autosave
   must not overwrite the reboot snapshot before startup restore succeeds.
+- The current-session marker is best-effort secondary panel metadata. Named and
+  ordinary saves/restores and deletion update it where applicable, but write
+  failures are logged and do not fail the primary operation. Installation,
+  upgrade repair, and uninstall preserve its owner-only file lifecycle.
 - Installer changes must remain idempotent, preserve manual autosave mode and
   user-authored menu actions, and have a symmetric uninstall path.
 - Keep the CLI dependency-free unless the project explicitly changes that
@@ -126,6 +157,10 @@ Hyprland session and its real saved database are intentionally part of the test.
 
 - Add focused regressions in `tests/test_omarchy_sesh.py` for matching,
   scheduling, migration, installer, or failure-semantics changes.
+- Prefer Restore run scenarios through `DeterministicHyprland`, deterministic
+  time, queued action results, replay state, and event-order assertions. Keep
+  focused matching, geometry, and Lua-encoding tests at their narrower seams;
+  use temporary SQLite databases for Snapshot history tests.
 - Update `README.md` when user-visible behavior or commands change.
 - Update `docs/session-restore-spec.md` when architecture, state, dispatch API,
   restore guarantees, or limitations change.

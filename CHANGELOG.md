@@ -4,6 +4,64 @@ All notable changes to `omarchy-sesh` are documented here.
 
 ## Unreleased
 
+## v0.2.8 - 2026-09-02
+
+### Added
+
+- The panel now flips to the named-session list and gives each row separate play
+  and delete controls. Deletion requires confirmation and supports pointer,
+  Enter, Escape, Left/Right, Tab, and `x` keyboard behavior.
+- The panel header now shows `auto`, `manual`, or the current named session.
+  `omarchy-sesh mode --json` reports both fields for panel consumers.
+- An owner-only
+  `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current-session.json` marker
+  provides best-effort current named-session metadata for the panel. Named saves
+  and restores attempt to set it; ordinary manual saves and automatic restores
+  attempt to clear it, periodic saves preserve it, and deletion of the current
+  name attempts to clear it. Write failures are logged without failing an
+  otherwise successful save, restore, or delete.
+
+### Changed
+
+- Snapshot history is now a deep module that owns schema migration,
+  transactions, selection, retention, naming/deletion, and storage error
+  classification behind one interface. It returns immutable Snapshots, and
+  each immutable Snapshot window uses snapshot-local order as identity instead
+  of exposing a SQLite row identity.
+- Restore run now prepares one immutable plan with a repeatable, effect-free
+  preview and single-use execution. The module retains the shared deadline,
+  concurrent launches, matching, placement/correction order, and typed outcome;
+  commands retain locks, markers, output, and exit translation.
+- `ProductionHyprland` and `DeterministicHyprland` now implement the same
+  semantic capture, observation, action, and result interface. Lua generation,
+  selectors, command redaction, monitor refresh, and animation lifetime remain
+  local to the production adapter, improving locality while keeping the module
+  seam narrow.
+- Restore tests now use deterministic compositor state, queued action results,
+  replay modeling, event ordering, deterministic time, and temporary SQLite
+  histories. Focused matching, geometry, and encoding tests remain at their
+  narrower seams, preserving depth and test leverage without weakening coverage.
+- Automated coverage now includes the panel/CLI source contracts and an
+  in-place schema-v6 upgrade fixture. Live QML acceptance remains outstanding.
+
+### Fixed
+
+- Transient capture, Snapshot history storage, focus, placement, monitor, and
+  tiled-replay failures retain retryable typed outcomes and translate to exit
+  75 where systemd may retry. Rejected mutations and permanent storage or
+  restore failures translate to exit 1 and do not create a restart loop.
+- Installation now creates the current-session marker owner-only, upgrades
+  repair its permissions, and uninstall removes it. Operation-time updates
+  remain best-effort secondary metadata.
+- The panel now reports an unknown autosave mode as `unavailable` rather than
+  presenting it as Manual mode.
+
+### Compatibility
+
+- The SQLite schema remains version 6 and existing databases migrate in place.
+  This release adds no dependencies and retains the existing CLI lock, marker,
+  output, restore ordering, and exit-status contracts.
+
 ## v0.2.7 - 2026-08-26
 
 ### Changed
@@ -174,8 +232,8 @@ All notable changes to `omarchy-sesh` are documented here.
   relaunched process opens a file-manager window instead of service mode only.
 - Incomplete or failed restores now keep autosave gated so they cannot replace
   the latest complete snapshot.
-- Restore marker writes are atomic, marker failures are retryable, and dry runs
-  no longer alter restore state.
+- Restore-complete marker writes are atomic, their failures are retryable, and
+  dry runs no longer alter restore state.
 - Existing restore markers no longer bypass live compositor IPC checks.
 - Autosave refreshes the Hyprland instance before every capture and clears
   stale compositor environment values.

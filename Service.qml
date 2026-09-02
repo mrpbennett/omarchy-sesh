@@ -16,13 +16,15 @@ Item {
 
   property bool installed: false
   property string mode: "manual"
+  property string sessionName: ""
   property bool modeKnown: false
-  property bool busy: checkProcess.running || installProcess.running || modeProcess.running || actionProcess.running || listProcess.running
+  property bool busy: checkProcess.running || installProcess.running || modeProcess.running || actionProcess.running || listProcess.running || deleteProcess.running
   property string status: ""
   property string error: ""
   property var sessions: []
   property bool sessionsLoading: false
   property string pendingAction: ""
+  property string listResultStatus: ""
   property bool startEnabledMode: false
   property bool installAfterCheck: false
   property bool preserveStatus: false
@@ -54,7 +56,7 @@ Item {
     if (keepStatus === true) preserveStatus = true
     if (modeProcess.running) return
     if (keepStatus !== true) preserveStatus = false
-    modeProcess.command = [binaryPath, "mode"]
+    modeProcess.command = [binaryPath, "mode", "--json"]
     modeProcess.running = true
   }
 
@@ -72,11 +74,14 @@ Item {
     return runAction("restore")
   }
 
-  function listSessions() {
+  // `resultStatus`, when given, survives the reload so a completed action
+  // (for example a delete) keeps reporting its own outcome.
+  function listSessions(resultStatus) {
     if (!installed || listProcess.running || actionProcess.running) return false
     sessions = []
     sessionsLoading = true
-    status = "Loading saved sessions..."
+    listResultStatus = resultStatus === undefined ? "" : resultStatus
+    status = listResultStatus !== "" ? listResultStatus : "Loading saved sessions..."
     error = ""
     listProcess.command = [binaryPath, "list", "--json"]
     listProcess.running = true
@@ -87,11 +92,20 @@ Item {
     return runAction("restore", name)
   }
 
+  function deleteSession(name) {
+    if (!installed || busy) return false
+    status = "Deleting session..."
+    error = ""
+    deleteProcess.command = [binaryPath, "delete", "--name", name]
+    deleteProcess.running = true
+    return true
+  }
+
   function runMode(nextMode) {
     if (!installed || busy) return false
     status = nextMode === "active" ? "Enabling autosave..." : "Saving session..."
     error = ""
-    modeProcess.command = [binaryPath, "mode", nextMode]
+    modeProcess.command = [binaryPath, "mode", nextMode, "--json"]
     modeProcess.running = true
     return true
   }
@@ -141,6 +155,7 @@ Item {
     stderr: StdioCollector { id: modeError; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
+        root.modeKnown = false
         if (root.preserveStatus) {
           root.preserveStatus = false
           return
@@ -151,9 +166,17 @@ Item {
         root.pendingAction = ""
         return
       }
-      var output = modeOutput.text.trim().split(/\s+/)
-      var value = output.length ? output[output.length - 1] : ""
+      var value = ""
+      var name = ""
+      try {
+        var parsed = JSON.parse(modeOutput.text.trim())
+        value = parsed.mode
+        name = typeof parsed.name === "string" ? parsed.name : ""
+      } catch (parseError) {
+        value = ""
+      }
       if (value !== "active" && value !== "manual") {
+        root.modeKnown = false
         root.preserveStatus = false
         root.status = ""
         root.error = "Unexpected autosave mode response"
@@ -161,6 +184,7 @@ Item {
         return
       }
       root.mode = value
+      root.sessionName = name
       root.modeKnown = true
       if (root.startEnabledMode) {
         root.startEnabledMode = false
@@ -195,11 +219,30 @@ Item {
         var sessions = JSON.parse(listOutput.text)
         if (!Array.isArray(sessions)) throw new Error("not an array")
         root.sessions = sessions
-        root.status = sessions.length ? "Choose a saved session" : "No named sessions saved"
+        root.status = root.listResultStatus !== ""
+          ? root.listResultStatus
+          : (sessions.length ? "Choose a saved session" : "No named sessions saved")
       } catch (error) {
         root.sessions = []
         root.status = ""
         root.error = "Could not read saved sessions"
+      }
+      root.listResultStatus = ""
+    }
+  }
+
+  Process {
+    id: deleteProcess
+    command: []
+    stdout: StdioCollector { id: deleteOutput; waitForEnd: true }
+    stderr: StdioCollector { id: deleteError; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.error = ""
+        root.listSessions(deleteOutput.text.trim() || "Session deleted")
+      } else {
+        root.status = ""
+        root.error = deleteError.text.trim() || deleteOutput.text.trim() || "Could not delete session"
       }
     }
   }

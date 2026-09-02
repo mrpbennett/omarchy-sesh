@@ -58,12 +58,28 @@ After installation the widget shows three actions:
 
 - **Active** — enables periodic autosave (default interval 60s).
 - **Manual** — disables autosave and saves the current session immediately.
-- **Restore** — opens a picker of named sessions to relaunch.
+- **Restore** — flips the panel around to the named-session list.
+
+The session list turns back to the three actions with Escape or the back arrow.
+Each row carries two actions:
+
+- **Play** — restores that named session (Enter also restores the selected row).
+- **Delete** — asks for confirmation, then removes the named session and its
+  snapshot from the database (`x` on the selected row does the same). The
+  confirmation defaults to Cancel; Left/Right or Tab switches buttons, Enter
+  answers, Escape cancels. Deleting cannot be undone.
+
+The panel header labels the current state as `auto` while autosave is active;
+in Manual mode it shows `manual` or the name recorded by the best-effort
+current-session metadata. Deleting that named session attempts to clear the
+label.
+If the mode cannot be determined, the header shows `unavailable`.
 
 On a fresh install autosave defaults to Active mode. Selecting **Manual**
 disables periodic autosave and captures the current desktop immediately;
-selecting **Active** again captures a new baseline and re-enables the periodic
-saver. A restore runs at the next graphical login via `omarchy-sesh.service`;
+selecting **Active** again captures a new baseline only when no successful
+restore marker exists, then re-enables the periodic saver. A restore runs at the
+next graphical login via `omarchy-sesh.service`;
 the autosave service is ordered after it and waits one interval before its first
 capture.
 Saves before logout, reboot, or shutdown happen synchronously so the reboot
@@ -75,14 +91,14 @@ See [How it works](#how-it-works) for the full save/restore behavior and
 ## CLI
 
 ```sh
-omarchy-sesh save [--label manual|logout] [--name NAME]                 # snapshot current windows
+omarchy-sesh save [--label LABEL] [--name NAME]                         # snapshot current windows
 omarchy-sesh restore [--name NAME] [--dry-run]                          # restore latest or named snapshot
 omarchy-sesh autosave [--interval 60]                                   # periodic save (crash cover)
 omarchy-sesh status                                                     # list saved sessions
-omarchy-sesh list                                                       # list named sessions
+omarchy-sesh list [--json]                                              # list named sessions
 omarchy-sesh delete --name NAME                                         # delete a named session
-omarchy-sesh mode [active|manual]                                       # query or change autosave mode
-omarchy-sesh acceptance [--expect-power-save|--expect-restore-failure]  # read-only live acceptance evidence
+omarchy-sesh mode [active|manual] [--json]                              # query/change mode and current session
+omarchy-sesh acceptance [--expect-power-save|--expect-restore-failure]  # live acceptance evidence only
 ```
 
 Config (optional): `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
@@ -104,13 +120,15 @@ a launch group can retry at least once. `monitor_fallback` accepts `"focused"`,
 rejected rather than treated as an unknown monitor. Each retention slot applies
 separately to complete and diagnostic snapshots.
 
-Unknown settings, invalid JSON, and invalid values are reported the same way
-everywhere but acted on differently, because a bad config must never cost you a
-session. `restore` fails closed: it reports the error, exits 2, and changes
-nothing, and its service does not restart-loop. `save` and `autosave` log the
-error and continue with the built-in defaults, so a typo cannot skip the logout
-snapshot or silently stop periodic saves. A file that cannot be read at all is
-treated as transient: every command logs it and continues with the defaults.
+Only `save`, `restore`, and `autosave` load this configuration. Unknown settings,
+invalid JSON, and invalid values are reported consistently but acted on
+differently, because a bad config must never cost you a session. `restore` fails
+closed: it reports the error, exits 2, and changes nothing, and its service does
+not restart-loop. `save` and `autosave` log the error and continue with the
+built-in defaults, so a typo cannot skip the logout snapshot or silently stop
+periodic saves. If those commands cannot read the file at all, they log the
+transient error and continue with the defaults. `status`, `list`, `delete`,
+`mode`, and `acceptance` do not load it.
 
 ## Dependencies
 
@@ -148,6 +166,11 @@ installer and CLI repair older permissive modes automatically. Restore failure
 logs omit launch commands; `restore --dry-run` intentionally prints them to the
 calling terminal for inspection.
 
+Snapshot history owns SQLite migration, atomic writes, selection, retention,
+and named-session deletion. It returns immutable Snapshots whose windows use
+their order within that Snapshot as identity, rather than a database row ID.
+The schema remains version 6; existing databases migrate in place.
+
 **Named save** (`omarchy-sesh save --name NAME`) captures the same state as a
 manual save and assigns it a unique name. Named sessions are independent from
 the automatic boot snapshot: they are retained until explicitly deleted and
@@ -158,6 +181,18 @@ that name again. Names may contain internal spaces but cannot be empty, padded
 with whitespace, contain control characters, or exceed 128 characters.
 The panel's **Restore** action lists these named sessions; create them from the
 CLI until a named-save panel action is added.
+
+After a successful named save or restore, the CLI attempts to keep the current
+name in
+`${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current-session.json` for the
+panel. An ordinary manual save or automatic restore attempts to clear it,
+periodic saves leave it alone, and deleting the current named session attempts
+to clear it.
+These updates are best-effort secondary panel metadata: failures are logged but
+do not fail an otherwise successful save, restore, or delete. Installation
+creates the file owner-only, upgrades repair its permissions, and uninstall
+removes it. `mode --json` reports both the autosave mode and this best-effort
+name.
 
 **Restore** (`omarchy-sesh restore`) loads the most recent complete session;
 a healthy empty session intentionally restores nothing. An advisory lock
@@ -186,6 +221,14 @@ resize before moving, and then return to their saved state. Restore verifies
 their final compositor geometry after a short settling interval and reapplies
 one mismatched placement pass.
 `--dry-run` prints the launch plan without executing it.
+
+Restore prepares one immutable Restore run from the selected Snapshot and its
+initial live observation. Its preview is repeatable and effect-free; execution
+is single-use. Production Hyprland IPC is behind an adapter that exposes the
+same semantic observations, actions, and typed results used by deterministic
+tests. Transport and temporarily unavailable storage, capture, focus,
+placement, monitor, or replay operations exit 75 so systemd may retry. Rejected
+operations and other permanent failures exit 1 and do not restart-loop.
 
 On Hyprland 0.56 or newer, complete and uniquely matched window groups are
 re-formed in saved member order after placement. Partial or ambiguous groups,
@@ -247,8 +290,8 @@ For a direct repository installation, run:
 
 Removes every trace: the binary, both systemd user units and their enablement,
 legacy Hyprland hook, marker-delimited power-menu overrides, session DB,
-lock, and logs. User-authored configuration is preserved. Idempotent and safe
-to rerun.
+operation lock, restore and current-session markers, and logs. User-authored
+configuration is preserved. Idempotent and safe to rerun.
 
 ## Development roadmap
 
@@ -258,8 +301,10 @@ coverage.
 
 ## Live Reboot Acceptance
 
-`omarchy-sesh acceptance` only reads systemd, Hyprland, and saved session state;
-it never saves, restores, changes mode, or powers off. Follow
+`omarchy-sesh acceptance` never performs a live save or restore, changes mode,
+or invokes a power action. Like every CLI invocation, startup may create or
+repair owner-only runtime state and migrate legacy XDG state, so it is not
+strictly read-only. Follow
 `docs/live-acceptance.md` for the controlled reboot, power-menu, and
 failure-recovery procedures.
 

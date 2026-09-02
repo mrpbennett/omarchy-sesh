@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "mrpbennett.sesh",
   "name": "Omarchy Sesh",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "author": "Paul Bennett",
   "license": "MIT",
   "description": "Save and restore Hyprland sessions from the Omarchy bar.",

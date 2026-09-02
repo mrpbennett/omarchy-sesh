@@ -18,12 +18,14 @@ AUTOSTART="$CONFIG_HOME/hypr/autostart.lua"
 MENU="$CONFIG_HOME/omarchy/extensions/omarchy-menu.jsonc"
 LEGACY_AUTOSTART="$HOME/.config/hypr/autostart.lua"
 LEGACY_MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
-DB="$STATE_HOME/omarchy/session.db"
-LOCK="$STATE_HOME/omarchy/session.lock"
-RESTORE_MARKER="$STATE_HOME/omarchy/restore-complete.json"
-INSTALL_MARKER="$STATE_HOME/omarchy/sesh-installed"
-MENU_CREATED_MARKER="$STATE_HOME/omarchy/sesh-menu-created"
-LOG_DIR="$STATE_HOME/omarchy/log"
+STATE_DIR="$STATE_HOME/omarchy"
+LOG_DIR="$STATE_DIR/log"
+DB="$STATE_DIR/session.db"
+LOCK="$STATE_DIR/session.lock"
+RESTORE_MARKER="$STATE_DIR/restore-complete.json"
+CURRENT_SESSION="$STATE_DIR/current-session.json"
+INSTALL_MARKER="$STATE_DIR/sesh-installed"
+MENU_CREATED_MARKER="$STATE_DIR/sesh-menu-created"
 
 MARKER_COMMENT="# omarchy-sesh: restore saved windows after login (guard skips if already restored)"
 LUA_MARKER_COMMENT="-- omarchy-sesh: restore saved windows after login (guard skips if already restored)"
@@ -31,6 +33,28 @@ RESTORE_LINE='hl.exec_cmd("sleep 2 && omarchy-sesh restore")'
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 
 removed=0
+
+validate_cleanup_directory() {
+  local path="$1"
+  if [[ -L "$path" ]]; then
+    echo "error: refusing unsafe cleanup directory (symlink): $path" >&2
+    return 1
+  fi
+  if [[ -e "$path" ]]; then
+    if [[ ! -d "$path" ]]; then
+      echo "error: refusing unsafe cleanup directory (not a directory): $path" >&2
+      return 1
+    fi
+    if [[ $(stat -c '%u' -- "$path") != "$(id -u)" ]]; then
+      echo "error: refusing unsafe cleanup directory (not user-owned): $path" >&2
+      return 1
+    fi
+  fi
+}
+
+# Validate the parent first so no child lookup can follow an unsafe state link.
+validate_cleanup_directory "$STATE_DIR"
+validate_cleanup_directory "$LOG_DIR"
 
 if ! "$SYSTEMCTL" --user stop omarchy-sesh-autosave.service omarchy-sesh.service >/dev/null 2>&1; then
   for unit in omarchy-sesh-autosave.service omarchy-sesh.service; do
@@ -146,10 +170,16 @@ if path.read_text().strip() == "{}":
 PY
 fi
 
-if [[ -f "$DB" || -f "$DB-wal" || -f "$DB-shm" || -f "$DB-journal" || -f "$LOCK" || -f "$RESTORE_MARKER" || -f "$INSTALL_MARKER" || -f "$MENU_CREATED_MARKER" ]]; then
-  rm -f "$DB" "$DB-wal" "$DB-shm" "$DB-journal" "$LOCK" "$RESTORE_MARKER" "$INSTALL_MARKER" "$MENU_CREATED_MARKER"
-  removed=1
-fi
+state_artifacts=(
+  "$DB" "$DB-wal" "$DB-shm" "$DB-journal" "$LOCK" "$RESTORE_MARKER"
+  "$CURRENT_SESSION" "$INSTALL_MARKER" "$MENU_CREATED_MARKER"
+)
+for artifact in "${state_artifacts[@]}"; do
+  if [[ -e "$artifact" || -L "$artifact" ]]; then
+    rm -f -- "$artifact"
+    removed=1
+  fi
+done
 
 if [[ -d "$LOG_DIR" ]]; then
   rm -f "$LOG_DIR/omarchy-sesh.log"
