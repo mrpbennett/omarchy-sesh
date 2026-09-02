@@ -48,9 +48,9 @@
       every final rectangle. Controlled reboot acceptance remains outstanding.
 - [x] **Translated tiled sizing**: restore simple two-window split ratios when
       monitor reordering changes the workspace origin but not its dimensions.
-- [ ] **Slow applications**: collect real startup timings and change the default
-      restore timeout only if the current configurable 20-second bound is
-      insufficient.
+- [ ] **Slow applications acceptance**: collect real startup timings for the
+      10-second panel and 60-second startup budgets, including the persisted
+      30-second observation grace before an incomplete startup retry.
 - [x] **Polling latency**: reduce window-discovery polling from 200 ms to 50 ms,
       limiting avoidable detection delay without changing restore semantics.
 - [ ] **Restore performance benchmark**: benchmark dispatch and window-discovery
@@ -65,6 +65,8 @@
 - [x] **Chromium app-mode launcher**: strictly recognized web-app windows launch
       individually through `omarchy-launch-webapp` when Chromium cannot recreate
       them through a bounded generic relaunch.
+- [x] **Supported terminal launchers**: restore Alacritty, Foot, Ghostty, Kitty,
+      and WezTerm as one OS window per saved row without replaying server modes.
 - [ ] **Additional launchers**: add more application-specific handling only for
       apps proven not to recreate their saved windows through bounded generic
       relaunches.

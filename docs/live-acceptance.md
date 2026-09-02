@@ -46,21 +46,20 @@ After login, run:
 omarchy-sesh acceptance --expect-restore-failure
 ```
 
-The command expects the restore unit to be failed, the restore marker to be
-incomplete, the autosave service to remain active when enabled, and the restore
-source to remain a complete snapshot. Separately inspect
+The command expects the restore unit to be failed, the completed-attempt marker
+to permit autosave, the autosave service to remain active when enabled, and the
+restore source to remain a complete snapshot. Separately inspect
 `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/restore-complete.json` and confirm
-its `instance` equals the current `HYPRLAND_INSTANCE_SIGNATURE`. Wait at least
-one autosave interval and confirm the log reports that autosave is waiting for
-startup restore rather than writing a periodic snapshot. Also inspect
-`omarchy-sesh status`: the failed restore must not replace the complete source
-snapshot. Restore the test application's launcher before the next normal reboot.
+its `instance` equals the current `HYPRLAND_INSTANCE_SIGNATURE`. Restore the
+test application's launcher before the next normal reboot.
 
 This is the permanent-failure case: confirm the restore command exits 1 and the
 unit does not restart-loop. In a separate controlled run, make one Hyprland
 observation or action temporarily unavailable without changing the Snapshot.
 Confirm the command exits 75, systemd retries, and a later attempt succeeds once
-IPC is available. Exercise capture, monitor movement/refresh, placement, focus,
+IPC is available. An incomplete launch also keeps autosave gated and records a
+30-second observation grace before startup relaunches missing rows. Exercise
+capture, monitor movement/refresh, placement, focus,
 and tiled replay separately when practical. A transient startup Restore run
 must leave autosave gated until a retry succeeds.
 

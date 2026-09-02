@@ -6,7 +6,7 @@ select
     id, session, ord, class, initial_class, title, initial_title, cmdline, cwd,
     workspace_id, workspace_name, monitor_name, monitor_description,
     at_x, at_y, size_w, size_h, floating, fullscreen, pinned, xwayland,
-    pid, group_id, group_ord
+    pid, group_id, group_ord, terminal_profile
 from main.windows
 order by session desc, ord, id;
 --
@@ -26,8 +26,3 @@ left join main.workspace_layouts wl on s.id = wl.session
 left join main.windows w on s.id = w.session
 group by s.id, s.created_at, s.label, s.capture_status, s.capture_error
 order by s.id;
---
-delete from sessions;
-delete from windows;
-delete from named_sessions;
-delete from workspace_layouts;

@@ -19,6 +19,7 @@ import tempfile
 import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import Enum, auto
 from pathlib import Path
 from types import MappingProxyType
@@ -55,8 +56,31 @@ DEFAULT_CONFIG = {
 
 DEFAULT_EXCLUDE = set(DEFAULT_CONFIG["exclude_classes"])
 CHROMIUM_NORMAL_CLASSES = {"chromium", "chromium-browser"}
+TERMINAL_EXECUTABLES = {
+    "alacritty": "alacritty",
+    "foot": "foot",
+    "footclient": "foot",
+    "ghostty": "ghostty",
+    "kitty": "kitty",
+    "wezterm": "wezterm",
+    "wezterm-gui": "wezterm",
+}
+TERMINAL_CLASSES = {
+    "Alacritty": "alacritty",
+    "alacritty": "alacritty",
+    "foot": "foot",
+    "footclient": "foot",
+    "org.codeberg.dnkl.foot": "foot",
+    "com.mitchellh.ghostty": "ghostty",
+    "ghostty": "ghostty",
+    "kitty": "kitty",
+    "org.wezfurlong.wezterm": "wezterm",
+    "wezterm": "wezterm",
+}
+TERMINAL_PROFILES = frozenset(TERMINAL_EXECUTABLES.values())
 RESTORE_TIMEOUT = 20.0
 RESTORE_RETRY_DELAY = 2.0
+RESTORE_INCOMPLETE_GRACE = 30.0
 RESTORE_POLL_INTERVAL = 0.05
 MAX_CONFIG_SECONDS = 2_147_483_647
 MAX_SNAPSHOT_RETENTION = 9_223_372_036_854_775_807
@@ -109,6 +133,7 @@ class SnapshotWindow(Mapping):
     pid: int | None
     group_id: int | None
     group_ord: int | None
+    terminal_profile: str | None
 
     _KEYS: ClassVar[tuple[str, ...]] = (
         "id",
@@ -134,6 +159,7 @@ class SnapshotWindow(Mapping):
         "pid",
         "group_id",
         "group_ord",
+        "terminal_profile",
     )
 
     @classmethod
@@ -176,6 +202,7 @@ class SnapshotWindow(Mapping):
             pid=value.get("pid"),
             group_id=value.get("group_id"),
             group_ord=value.get("group_ord"),
+            terminal_profile=value.get("terminal_profile"),
         )
 
     @property
@@ -319,6 +346,21 @@ class MutationStatus(Enum):
     UNCHANGED = auto()
     REJECTED = auto()
     UNAVAILABLE = auto()
+
+
+class TiledStatus(Enum):
+    OK = auto()
+    DEGRADED = auto()
+    REJECTED = auto()
+
+    def __bool__(self):
+        return self is TiledStatus.OK
+
+
+def merge_tiled_failure(current, new):
+    if current is TiledStatus.REJECTED or new is TiledStatus.REJECTED:
+        return TiledStatus.REJECTED
+    return new if current is None else current
 
 
 def _freeze(value):
@@ -981,6 +1023,22 @@ def argparse_session_name(value):
         raise argparse.ArgumentTypeError(f"invalid session name: {e}") from e
 
 
+def argparse_restore_timeout(value):
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("restore timeout must be a number") from error
+    if (
+        not math.isfinite(timeout)
+        or timeout < RESTORE_RETRY_DELAY
+        or timeout > MAX_CONFIG_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            f"restore timeout must be from {RESTORE_RETRY_DELAY} to {MAX_CONFIG_SECONDS}"
+        )
+    return timeout
+
+
 def log(msg):
     secure_state_storage()
     with open(LOG_PATH, "a") as f:
@@ -1285,6 +1343,7 @@ class SnapshotHistory:
         "pid",
         "group_id",
         "group_ord",
+        "terminal_profile",
     )
 
     def _selected_window(self, values):
@@ -1355,6 +1414,7 @@ class SnapshotHistory:
                     pid INTEGER,
                     group_id INTEGER,
                     group_ord INTEGER,
+                    terminal_profile TEXT,
                     FOREIGN KEY (session) REFERENCES sessions(id)
                 )
                 """
@@ -1414,6 +1474,10 @@ class SnapshotHistory:
                 connection.execute("ALTER TABLE windows ADD COLUMN group_id INTEGER")
             if "group_ord" not in window_columns:
                 connection.execute("ALTER TABLE windows ADD COLUMN group_ord INTEGER")
+            if "terminal_profile" not in window_columns:
+                connection.execute(
+                    "ALTER TABLE windows ADD COLUMN terminal_profile TEXT"
+                )
             layout_columns = {
                 row[1]
                 for row in connection.execute("PRAGMA table_info(workspace_layouts)")
@@ -1432,7 +1496,7 @@ class SnapshotHistory:
                     connection.execute(
                         f"ALTER TABLE workspace_layouts ADD COLUMN {column} INTEGER"
                     )
-            connection.execute("PRAGMA user_version = 6")
+            connection.execute("PRAGMA user_version = 7")
             connection.commit()
             if self._path == DB_PATH:
                 secure_state_storage()
@@ -1488,8 +1552,8 @@ class SnapshotHistory:
                         "INSERT INTO windows (session, ord, class, initial_class, title, initial_title, "
                         "cmdline, cwd, workspace_id, workspace_name, monitor_name, monitor_description, "
                         "at_x, at_y, size_w, size_h, floating, fullscreen, pinned, xwayland, pid, "
-                        "group_id, group_ord) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                        "?, ?, ?, ?, ?, ?, ?, ?)",
+                        "group_id, group_ord, terminal_profile) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         [
                             (
                                 session_id,
@@ -1515,6 +1579,7 @@ class SnapshotHistory:
                                 row.get("pid"),
                                 row.get("group_id"),
                                 row.get("group_ord"),
+                                row.get("terminal_profile"),
                             )
                             for index, row in enumerate(capture.windows)
                         ],
@@ -2004,6 +2069,13 @@ def _save_clients(
             "initial_title": w.get("initialTitle", ""),
             "cmdline": cmdline,
             "cwd": cwd,
+            "terminal_profile": effective_terminal_profile(
+                {
+                    "class": cls,
+                    "initial_class": w.get("initialClass", cls),
+                    "cmdline": cmdline,
+                }
+            ),
             "workspace_id": ws.get("id"),
             "workspace_name": ws.get("name"),
             "monitor_name": monitor.get("name"),
@@ -2019,6 +2091,16 @@ def _save_clients(
             "pid": pid,
         }
         captured.append((row, w.get("address"), w.get("grouped")))
+    terminal_pid_counts = {}
+    for row, _, _ in captured:
+        if row["terminal_profile"] and row["pid"] is not None:
+            terminal_pid_counts[row["pid"]] = terminal_pid_counts.get(row["pid"], 0) + 1
+    for row, _, _ in captured:
+        if row["terminal_profile"] and (
+            terminal_pid_counts.get(row["pid"], 0) > 1
+            or not terminal_cwd_is_attributable(row)
+        ):
+            row["cwd"] = None
     assign_snapshot_groups(captured)
     rows = [row for row, _, _ in captured]
     workspace_layouts = captured_workspace_layouts(
@@ -2410,7 +2492,7 @@ def _production_action(action):
 
 
 def verify_floating_placements(
-    rows, matches, *, compositor=None, clock=None, write_log=None
+    rows, matches, *, compositor=None, clock=None, deadline=None, write_log=None
 ):
     compositor = compositor or ProductionHyprland()
     clock = clock or SystemClockAdapter()
@@ -2425,6 +2507,8 @@ def verify_floating_placements(
     if not expected:
         return True
 
+    if deadline is not None and clock.monotonic() + RESTORE_POLL_INTERVAL > deadline:
+        return False
     clock.sleep(RESTORE_POLL_INTERVAL)
     clients = observed(compositor, ObservationKind.WINDOWS)
     if clients is None:
@@ -2450,6 +2534,8 @@ def verify_floating_placements(
             return None
         if not placement.succeeded:
             mutation_ok = False
+    if deadline is not None and clock.monotonic() + RESTORE_POLL_INTERVAL > deadline:
+        return False
     clock.sleep(RESTORE_POLL_INTERVAL)
     clients = observed(compositor, ObservationKind.WINDOWS)
     if clients is None:
@@ -3112,9 +3198,12 @@ def restore_nested_tiled_layouts(
     focus_context=None,
     *,
     compositor=None,
+    clock=None,
+    deadline=None,
     write_log=None,
 ):
     compositor = compositor or ProductionHyprland()
+    clock = clock or SystemClockAdapter()
     write_log = log if write_log is None else write_log
     rows_by_workspace = {}
     for row in rows:
@@ -3269,35 +3358,52 @@ def restore_nested_tiled_layouts(
         return None
 
     for workspace_id, workspace_rows, layout, current_workarea, tree in candidates:
-        result, addresses = replay_workspace_tree(
-            workspace_id,
-            workspace_rows,
-            matches,
-            tree,
-            focus_context,
-            compositor=compositor,
-        )
-        if result is None:
-            recover_replay_workspace(
-                workspace_id, addresses, focus_context, compositor=compositor
+        for attempt in range(2):
+            if deadline is not None and clock.monotonic() >= deadline:
+                return TiledStatus.DEGRADED
+            result, addresses = replay_workspace_tree(
+                workspace_id,
+                workspace_rows,
+                matches,
+                tree,
+                focus_context,
+                compositor=compositor,
             )
-            return None
-        refreshed = observed(compositor, ObservationKind.WINDOWS)
-        if refreshed is None:
-            recover_replay_workspace(
-                workspace_id, addresses, focus_context, compositor=compositor
-            )
-            return None
-        if not result or not workspace_geometry_matches(
-            workspace_rows, matches, refreshed, layout, current_workarea
-        ):
+            if result is None:
+                recover_replay_workspace(
+                    workspace_id, addresses, focus_context, compositor=compositor
+                )
+                return None
+            if not result:
+                recovery = recover_replay_workspace(
+                    workspace_id, addresses, focus_context, compositor=compositor
+                )
+                return None if recovery is None else TiledStatus.REJECTED
+            if (
+                deadline is not None
+                and clock.monotonic() + RESTORE_POLL_INTERVAL > deadline
+            ):
+                return TiledStatus.DEGRADED
+            clock.sleep(RESTORE_POLL_INTERVAL)
+            refreshed = observed(compositor, ObservationKind.WINDOWS)
+            if refreshed is None:
+                recover_replay_workspace(
+                    workspace_id, addresses, focus_context, compositor=compositor
+                )
+                return None
+            if workspace_geometry_matches(
+                workspace_rows, matches, refreshed, layout, current_workarea
+            ):
+                break
+            if attempt == 0:
+                continue
             write_log(
                 f"restore: tiled replay verification failed on workspace {workspace_id}"
             )
             recovery = recover_replay_workspace(
                 workspace_id, addresses, focus_context, compositor=compositor
             )
-            return None if recovery is None else False
+            return None if recovery is None else TiledStatus.DEGRADED
         if restore_loaded_focus:
             focus_result = restore_focus_context(
                 focus_context, compositor=compositor
@@ -3305,7 +3411,7 @@ def restore_nested_tiled_layouts(
             if focus_result is None:
                 return None
             if not focus_result:
-                return False
+                return TiledStatus.REJECTED
         clients = refreshed
     return True
 
@@ -3381,12 +3487,20 @@ def two_window_geometry_matches(rows, matches, current):
 
 
 def restore_tiled_slots(
-    rows, matches, clients, *, compositor=None, write_log=None
+    rows,
+    matches,
+    clients,
+    *,
+    compositor=None,
+    clock=None,
+    deadline=None,
+    write_log=None,
 ):
     compositor = compositor or ProductionHyprland()
+    clock = clock or SystemClockAdapter()
     write_log = log if write_log is None else write_log
     rows_by_workspace = {}
-    all_ok = True
+    failure_status = None
     for row in rows:
         if not row.get("floating") and row.get("workspace_id") is not None:
             rows_by_workspace.setdefault(row["workspace_id"], []).append(row)
@@ -3426,6 +3540,10 @@ def restore_tiled_slots(
         ]
         occupant_order = [current[index]["address"] for index in current_split[1]]
         if desired_order != occupant_order:
+            if deadline is not None and clock.monotonic() >= deadline:
+                return merge_tiled_failure(
+                    failure_status, TiledStatus.DEGRADED
+                )
             result = compositor.apply(
                 SwapWindows(address=desired_order[0], target=occupant_order[0])
             )
@@ -3435,12 +3553,17 @@ def restore_tiled_slots(
                         "restore: Hyprland IPC failed while arranging tiled windows"
                     )
                     return None
-                all_ok = False
+                failure_status = merge_tiled_failure(
+                    failure_status, TiledStatus.REJECTED
+                )
                 failed_workspaces.add(workspace_id)
                 continue
             swapped_workspaces.add(workspace_id)
 
     if swapped_workspaces:
+        if deadline is not None and clock.monotonic() + RESTORE_POLL_INTERVAL > deadline:
+            return merge_tiled_failure(failure_status, TiledStatus.DEGRADED)
+        clock.sleep(RESTORE_POLL_INTERVAL)
         clients = observed(compositor, ObservationKind.WINDOWS)
         if clients is None:
             write_log("restore: Hyprland IPC failed after arranging tiled windows")
@@ -3454,7 +3577,9 @@ def restore_tiled_slots(
         )
         if context is None:
             if workspace_id in swapped_workspaces:
-                all_ok = False
+                failure_status = merge_tiled_failure(
+                    failure_status, TiledStatus.DEGRADED
+                )
                 failed_workspaces.add(workspace_id)
             continue
         current, client_by_address = context
@@ -3471,7 +3596,9 @@ def restore_tiled_slots(
             )
         ):
             if workspace_id in swapped_workspaces:
-                all_ok = False
+                failure_status = merge_tiled_failure(
+                    failure_status, TiledStatus.DEGRADED
+                )
                 failed_workspaces.add(workspace_id)
             continue
         if workspace_id in swapped_workspaces:
@@ -3480,7 +3607,9 @@ def restore_tiled_slots(
             ]
             occupant_order = [current[index]["address"] for index in current_split[1]]
             if desired_order != occupant_order:
-                all_ok = False
+                failure_status = merge_tiled_failure(
+                    failure_status, TiledStatus.DEGRADED
+                )
                 failed_workspaces.add(workspace_id)
                 continue
 
@@ -3503,6 +3632,8 @@ def restore_tiled_slots(
                 )
                 candidates.append((error, client, desired))
         _, client, desired = max(candidates, key=lambda candidate: candidate[0])
+        if deadline is not None and clock.monotonic() >= deadline:
+            return merge_tiled_failure(failure_status, TiledStatus.DEGRADED)
         result = compositor.apply(
             ResizeWindow(
                 address=client["address"], width=desired[2], height=desired[3]
@@ -3514,12 +3645,17 @@ def restore_tiled_slots(
                     "restore: Hyprland IPC failed while resizing tiled windows"
                 )
                 return None
-            all_ok = False
+            failure_status = merge_tiled_failure(
+                failure_status, TiledStatus.REJECTED
+            )
             failed_workspaces.add(workspace_id)
             continue
         resized = True
 
     if resized:
+        if deadline is not None and clock.monotonic() + RESTORE_POLL_INTERVAL > deadline:
+            return merge_tiled_failure(failure_status, TiledStatus.DEGRADED)
+        clock.sleep(RESTORE_POLL_INTERVAL)
         clients = observed(compositor, ObservationKind.WINDOWS)
         if clients is None:
             write_log("restore: Hyprland IPC failed after resizing tiled windows")
@@ -3542,7 +3678,9 @@ def restore_tiled_slots(
                 write_log(
                     f"restore: tiled geometry did not settle on workspace {workspace_id}"
                 )
-                all_ok = False
+                failure_status = merge_tiled_failure(
+                    failure_status, TiledStatus.DEGRADED
+                )
             continue
 
         for index, row in enumerate(workspace_rows):
@@ -3551,6 +3689,10 @@ def restore_tiled_slots(
             if desired == occupant:
                 continue
             other_index = slot_addresses.index(desired)
+            if deadline is not None and clock.monotonic() >= deadline:
+                return merge_tiled_failure(
+                    failure_status, TiledStatus.DEGRADED
+                )
             result = compositor.apply(
                 SwapWindows(address=desired, target=occupant)
             )
@@ -3560,13 +3702,15 @@ def restore_tiled_slots(
                         "restore: Hyprland IPC failed while correcting tiled slots"
                     )
                     return None
-                all_ok = False
+                failure_status = merge_tiled_failure(
+                    failure_status, TiledStatus.REJECTED
+                )
                 break
             slot_addresses[index], slot_addresses[other_index] = (
                 slot_addresses[other_index],
                 slot_addresses[index],
             )
-    return all_ok
+    return TiledStatus.OK if failure_status is None else failure_status
 
 
 def restore_tiled_layouts(
@@ -3577,9 +3721,12 @@ def restore_tiled_layouts(
     focus_context=None,
     *,
     compositor=None,
+    clock=None,
+    deadline=None,
     write_log=None,
 ):
     compositor = compositor or ProductionHyprland()
+    clock = clock or SystemClockAdapter()
     write_log = log if write_log is None else write_log
     nested_result = restore_nested_tiled_layouts(
         rows,
@@ -3588,6 +3735,8 @@ def restore_tiled_layouts(
         layouts or {},
         focus_context,
         compositor=compositor,
+        clock=clock,
+        deadline=deadline,
         write_log=write_log,
     )
     if nested_result is None:
@@ -3597,21 +3746,60 @@ def restore_tiled_layouts(
         write_log("restore: Hyprland IPC failed after replaying tiled layouts")
         return None
     slots_result = restore_tiled_slots(
-        rows, matches, clients, compositor=compositor, write_log=write_log
+        rows,
+        matches,
+        clients,
+        compositor=compositor,
+        clock=clock,
+        deadline=deadline,
+        write_log=write_log,
     )
     if slots_result is None:
         return None
-    return nested_result and slots_result
+    if slots_result is TiledStatus.DEGRADED and (
+        deadline is None or clock.monotonic() < deadline
+    ):
+        clients = observed(compositor, ObservationKind.WINDOWS)
+        if clients is None:
+            return None
+        slots_result = restore_tiled_slots(
+            rows,
+            matches,
+            clients,
+            compositor=compositor,
+            clock=clock,
+            deadline=deadline,
+            write_log=write_log,
+        )
+        if slots_result is None:
+            return None
+    if (
+        nested_result is TiledStatus.REJECTED
+        or nested_result is False
+        or slots_result is TiledStatus.REJECTED
+    ):
+        return TiledStatus.REJECTED
+    if (
+        nested_result is TiledStatus.DEGRADED
+        or slots_result is TiledStatus.DEGRADED
+    ):
+        return TiledStatus.DEGRADED
+    return TiledStatus.OK
+
+
+def read_restore_marker():
+    try:
+        marker = json.loads(RESTORE_MARKER_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return marker if isinstance(marker, dict) else {}
 
 
 def restore_was_completed(sid):
     instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     if not instance:
         return False
-    try:
-        marker = json.loads(RESTORE_MARKER_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
+    marker = read_restore_marker()
     return (
         marker.get("session") == sid
         and marker.get("instance") == instance
@@ -3623,14 +3811,29 @@ def restore_is_ready():
     instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     if not instance:
         return False
-    try:
-        marker = json.loads(RESTORE_MARKER_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
+    marker = read_restore_marker()
     return marker.get("instance") == instance and marker.get("complete") is True
 
 
-def mark_restore_completed(sid, complete=True):
+def incomplete_restore_retry_delay(sid):
+    marker = read_restore_marker()
+    instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if (
+        marker.get("session") != sid
+        or marker.get("instance") != instance
+        or marker.get("complete") is not False
+        or not marker.get("attempted_windows")
+    ):
+        return 0.0
+    attempted_at = marker.get("attempted_at")
+    if type(attempted_at) not in (int, float) or not math.isfinite(attempted_at):
+        return 0.0
+    return max(0.0, RESTORE_INCOMPLETE_GRACE - (time.time() - attempted_at))
+
+
+def mark_restore_completed(
+    sid, complete=True, *, attempted_windows=(), attempted_at=None
+):
     instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     if not instance:
         return False
@@ -3638,9 +3841,11 @@ def mark_restore_completed(sid, complete=True):
     try:
         secure_state_storage()
         with tempfile.NamedTemporaryFile("w", dir=STATE_DIR, delete=False) as handle:
-            json.dump(
-                {"session": sid, "instance": instance, "complete": complete}, handle
-            )
+            marker = {"session": sid, "instance": instance, "complete": complete}
+            if not complete and attempted_windows:
+                marker["attempted_windows"] = sorted(set(attempted_windows))
+                marker["attempted_at"] = time.time() if attempted_at is None else attempted_at
+            json.dump(marker, handle)
             handle.flush()
             os.fsync(handle.fileno())
             temporary = Path(handle.name)
@@ -3753,10 +3958,101 @@ def chromium_webapp_url(row):
     return None
 
 
+def effective_terminal_profile(row):
+    persisted = row.get("terminal_profile")
+    if persisted in TERMINAL_PROFILES:
+        return persisted
+    try:
+        argv = shlex.split(row.get("cmdline") or "")
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    profile = TERMINAL_EXECUTABLES.get(Path(argv[0]).name)
+    if profile is None:
+        return None
+    class_profiles = {
+        TERMINAL_CLASSES[value]
+        for value in (row.get("class"), row.get("initial_class"))
+        if value in TERMINAL_CLASSES
+    }
+    if class_profiles and class_profiles != {profile}:
+        return None
+    return profile
+
+
+def terminal_rows_with_safe_cwd(rows):
+    terminal_pids = {}
+    for row in rows:
+        if effective_terminal_profile(row) and row.get("pid") is not None:
+            terminal_pids[row["pid"]] = terminal_pids.get(row["pid"], 0) + 1
+    return {
+        row["id"]
+        for row in rows
+        if effective_terminal_profile(row)
+        and row.get("cwd")
+        and terminal_cwd_is_attributable(row)
+        and row.get("pid") is not None
+        and terminal_pids.get(row["pid"]) == 1
+        and Path(row["cwd"]).is_dir()
+    }
+
+
+def terminal_cwd_is_attributable(row):
+    profile = effective_terminal_profile(row)
+    try:
+        argv = shlex.split(row.get("cmdline") or "")
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    options = set(argv[1:])
+    if profile == "ghostty":
+        return not any(
+            option.startswith(
+                ("--gtk-single-instance", "--initial-window=false")
+            )
+            for option in options
+        )
+    if profile == "kitty":
+        return not any(
+            option == "-1" or option.startswith("--single-instance")
+            for option in options
+        )
+    if profile == "alacritty":
+        return not any(option in ("-d", "--daemon") for option in options)
+    if profile == "foot":
+        return Path(argv[0]).name != "footclient" and not any(
+            option.startswith("--server")
+            or option == "-s"
+            or (option.startswith("-s") and not option.startswith("--"))
+            for option in options
+        )
+    if profile == "wezterm":
+        return False
+    return False
+
+
+def terminal_launch_signature(row):
+    profile = effective_terminal_profile(row)
+    if profile is None:
+        return None
+    return (
+        profile,
+        row.get("class"),
+        row.get("initial_class"),
+        row.get("title"),
+        row.get("initial_title"),
+        row.get("workspace_id"),
+    )
+
+
 def process_groups(rows):
     groups = {}
     for row in rows:
-        if chromium_webapp_url(row):
+        if effective_terminal_profile(row):
+            key = ("terminal", row["id"])
+        elif chromium_webapp_url(row):
             key = ("webapp", row["id"])
         else:
             key = (
@@ -3787,7 +4083,52 @@ def normalized_cmdline(cmdline):
         return cmdline
 
 
-def launch_command(row):
+def terminal_launch_command(row, profile, *, use_cwd):
+    try:
+        executable = shlex.split(row["cmdline"])[0]
+    except (IndexError, ValueError):
+        executable = profile
+    executable_path = Path(executable)
+    if profile == "foot" and executable_path.name == "footclient":
+        executable = str(executable_path.with_name("foot"))
+    elif profile == "wezterm" and executable_path.name == "wezterm-gui":
+        executable = str(executable_path.with_name("wezterm"))
+
+    argv = [executable]
+    cwd = row.get("cwd") if use_cwd else None
+    if profile == "alacritty":
+        argv.extend(["--working-directory", cwd] if cwd else [])
+    elif profile == "foot":
+        argv.extend([f"--working-directory={cwd}"] if cwd else [])
+    elif profile == "ghostty":
+        argv.append("+new-window")
+        argv.extend([f"--working-directory={cwd}"] if cwd else [])
+    elif profile == "kitty":
+        argv.extend(["--session", "none"])
+        argv.extend(["--directory", cwd] if cwd else [])
+    elif profile == "wezterm":
+        argv.extend(["start", "--always-new-process", "--no-auto-connect"])
+        argv.extend(["--cwd", cwd] if cwd else [])
+    return shlex.join(argv)
+
+
+def terminal_executable_available(row, command):
+    if effective_terminal_profile(row) is None:
+        return True
+    try:
+        executable = shlex.split(command)[0]
+    except (IndexError, ValueError):
+        return False
+    path = Path(executable)
+    return path.is_file() if path.is_absolute() else shutil.which(executable) is not None
+
+
+def launch_command(row, *, terminal_cwd=None):
+    profile = effective_terminal_profile(row)
+    if profile:
+        if terminal_cwd is None:
+            terminal_cwd = terminal_cwd_is_attributable(row)
+        return terminal_launch_command(row, profile, use_cwd=terminal_cwd)
     webapp_url = chromium_webapp_url(row)
     if webapp_url:
         return shlex.join(["omarchy-launch-webapp", webapp_url])
@@ -3819,8 +4160,8 @@ def launch_command(row):
     return command
 
 
-def launch_request(row):
-    command = launch_command(row)
+def launch_request(row, *, terminal_cwd=None):
+    command = launch_command(row, terminal_cwd=terminal_cwd)
     rules = []
     if row.get("workspace_id") is not None:
         workspace = f"{row['workspace_id']} silent"
@@ -4004,12 +4345,32 @@ def _production_restore_window_group(addresses):
     return " ".join(operations)
 
 
+class RestoreOutcomeKind(Enum):
+    COMPLETE = auto()
+    DEGRADED = auto()
+    INCOMPLETE = auto()
+    FAILED = auto()
+
+
 @dataclass(frozen=True)
 class RestoreOutcome:
     restored_windows: int
     permanent_failures: int
     launched_processes: int
     retryable_failure: bool
+    missing_windows: int = 0
+    degraded_failures: int = 0
+    attempted_windows: tuple[int, ...] = dataclass_field(default=(), compare=False)
+
+    @property
+    def kind(self):
+        if self.missing_windows:
+            return RestoreOutcomeKind.INCOMPLETE
+        if self.permanent_failures:
+            return RestoreOutcomeKind.FAILED
+        if self.degraded_failures:
+            return RestoreOutcomeKind.DEGRADED
+        return RestoreOutcomeKind.COMPLETE
 
 
 @dataclass(frozen=True)
@@ -4024,9 +4385,11 @@ class RestorePreviewEntry:
 class RestorePreview:
     entries: tuple
     maximum_processes: int
+    window_ids: tuple[int, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "entries", tuple(self.entries))
+        object.__setattr__(self, "window_ids", tuple(self.window_ids))
 
 
 class RestoreRun:
@@ -4040,8 +4403,9 @@ class RestoreRun:
         "_initial_matches",
         "_launch_groups",
         "_preview",
-        "_settings",
+        "_safe_terminal_cwds",
         "_sealed",
+        "_settings",
         "_snapshot",
         "_write_log",
     )
@@ -4072,19 +4436,26 @@ class RestoreRun:
             match_windows(snapshot.windows, initial_clients, max_rank=2)
         )
         launch_groups = tuple(tuple(group) for group in process_groups(snapshot.windows))
+        safe_terminal_cwds = terminal_rows_with_safe_cwd(snapshot.windows)
         entries = []
         maximum_processes = 0
+        launch_window_ids = []
         for group in launch_groups:
             missing = [row for row in group if row["id"] not in initial_matches]
             if not missing:
                 continue
-            command, rules, _ = launch_request(process_launch_row(group))
+            launch_row = process_launch_row(group)
+            command, rules, _ = launch_request(
+                launch_row,
+                terminal_cwd=launch_row["id"] in safe_terminal_cwds,
+            )
             entries.append(
                 RestorePreviewEntry(
                     group[0]["class"], command, rules, len(missing)
                 )
             )
             maximum_processes += len(missing)
+            launch_window_ids.extend(row["id"] for row in missing)
 
         self = object.__new__(cls)
         self._snapshot = snapshot
@@ -4092,7 +4463,10 @@ class RestoreRun:
         self._initial_matches = initial_matches
         self._initial_clients = tuple(initial_clients)
         self._launch_groups = launch_groups
-        self._preview = RestorePreview(tuple(entries), maximum_processes)
+        self._preview = RestorePreview(
+            tuple(entries), maximum_processes, tuple(launch_window_ids)
+        )
+        self._safe_terminal_cwds = frozenset(safe_terminal_cwds)
         self._compositor = compositor
         self._clock = clock or SystemClockAdapter()
         self._write_log = log if write_log is None else write_log
@@ -4108,13 +4482,7 @@ class RestoreRun:
             raise RuntimeError("a prepared Restore run can execute only once")
         self._executed = True
         with self._compositor.mutations():
-            restored, failures, launched_processes, retryable_failure = self._execute_once()
-        return RestoreOutcome(
-            restored_windows=restored,
-            permanent_failures=failures,
-            launched_processes=launched_processes,
-            retryable_failure=retryable_failure,
-        )
+            return self._execute_once()
 
     def _execute_once(self):
         rows = self._snapshot.windows
@@ -4126,6 +4494,7 @@ class RestoreRun:
         compositor = self._compositor
         clock = self._clock
         write_log = self._write_log
+        deadline = clock.monotonic() + restore_timeout
         row_by_id = {row["id"]: row for row in rows}
         matches = dict(initial_matches)
         used_addresses = {
@@ -4135,7 +4504,9 @@ class RestoreRun:
         }
         restored = 0
         failures = 0
+        degraded_failures = 0
         launched_processes = 0
+        attempted_windows = set()
         handled = set()
         placed = set()
         client_by_address = {
@@ -4143,6 +4514,21 @@ class RestoreRun:
             for client in initial_clients
             if client.get("address")
         }
+
+        def outcome(*, retryable=False, missing=0, permanent_failures=None):
+            return RestoreOutcome(
+                restored_windows=restored,
+                permanent_failures=(
+                    failures
+                    if permanent_failures is None
+                    else permanent_failures
+                ),
+                launched_processes=launched_processes,
+                retryable_failure=retryable,
+                missing_windows=missing,
+                degraded_failures=degraded_failures,
+                attempted_windows=tuple(sorted(attempted_windows)),
+            )
         monitor_targets, current_monitors, monitor_ipc_failed = (
             load_workspace_monitor_context(
                 rows,
@@ -4152,11 +4538,13 @@ class RestoreRun:
             )
         )
         if monitor_ipc_failed:
-            return restored, len(rows), launched_processes, True
+            return outcome(retryable=True, permanent_failures=len(rows))
         prepared_workspaces = set()
         failed_monitor_workspaces = set()
 
         for row_id, address in matches.items():
+            if clock.monotonic() >= deadline:
+                break
             row = row_by_id[row_id]
             workspace_id = row.get("workspace_id")
             target = monitor_targets.get(workspace_id)
@@ -4174,7 +4562,7 @@ class RestoreRun:
                 compositor=compositor,
             )
             if monitor_result.status is MutationStatus.UNAVAILABLE:
-                return restored, failures, launched_processes, True
+                return outcome(retryable=True)
             monitor_ok = monitor_result.succeeded
             if not monitor_ok:
                 failed_monitor_workspaces.add(workspace_id)
@@ -4195,7 +4583,7 @@ class RestoreRun:
                 else MutationResult(MutationStatus.REJECTED)
             )
             if placement.status is MutationStatus.UNAVAILABLE:
-                return restored, failures, launched_processes, True
+                return outcome(retryable=True)
             if placement.succeeded:
                 restored += 1
                 placed.add(row_id)
@@ -4204,6 +4592,16 @@ class RestoreRun:
             handled.add(row_id)
 
         states = []
+        terminal_signature_counts = {}
+        for group in self._launch_groups:
+            missing = [row for row in group if row["id"] not in matches]
+            if not missing:
+                continue
+            signature = terminal_launch_signature(process_launch_row(group))
+            if signature is not None:
+                terminal_signature_counts[signature] = (
+                    terminal_signature_counts.get(signature, 0) + 1
+                )
         for group in self._launch_groups:
             missing = [row for row in group if row["id"] not in matches]
             if not missing:
@@ -4215,6 +4613,15 @@ class RestoreRun:
                 "max_attempts": len(missing),
                 "next_retry": clock.monotonic(),
                 "launch_row": launch_row,
+                "serial_key": (
+                    terminal_launch_signature(launch_row)
+                    if terminal_signature_counts.get(
+                        terminal_launch_signature(launch_row), 0
+                    )
+                    > 1
+                    else None
+                ),
+                "launch_succeeded": False,
             }
             states.append(state)
 
@@ -4222,27 +4629,51 @@ class RestoreRun:
             if any(row["id"] in matches for row in group):
                 state["next_retry"] = clock.monotonic() + RESTORE_RETRY_DELAY
                 continue
-            _, _, action = launch_request(launch_row)
+            if state["serial_key"] is not None and any(
+                previous["serial_key"] == state["serial_key"]
+                and previous["launch_succeeded"]
+                and any(row["id"] not in handled for row in previous["rows"])
+                for previous in states[:-1]
+            ):
+                continue
+            if clock.monotonic() >= deadline:
+                continue
+            command, _, action = launch_request(
+                launch_row,
+                terminal_cwd=launch_row["id"] in self._safe_terminal_cwds,
+            )
+            if not terminal_executable_available(launch_row, command):
+                failures += len(missing)
+                handled.update(row["id"] for row in missing)
+                state["attempts"] = state["max_attempts"]
+                write_log(
+                    f"restore: terminal emulator unavailable for {launch_row['class']}"
+                )
+                continue
             launch = compositor.apply(action)
             if launch.succeeded:
                 state["attempts"] = 1
+                state["launch_succeeded"] = True
+                attempted_windows.update(row["id"] for row in state["rows"])
                 state["next_retry"] = clock.monotonic() + RESTORE_RETRY_DELAY
                 launched_processes += 1
             elif launch.status is MutationStatus.UNAVAILABLE:
-                return restored, failures + len(rows) - len(handled), launched_processes, True
+                return outcome(
+                    retryable=True,
+                    permanent_failures=failures + len(rows) - len(handled),
+                )
             else:
                 state["attempts"] = state["max_attempts"]
+                failures += len(missing)
+                handled.update(row["id"] for row in missing)
 
-        deadline = clock.monotonic() + restore_timeout
         while len(handled) < len(rows) and clock.monotonic() < deadline:
             clients = observed(compositor, ObservationKind.WINDOWS)
             if clients is None:
                 write_log("restore: Hyprland IPC failed while waiting for windows")
-                return (
-                    restored,
-                    failures + len(rows) - len(handled),
-                    launched_processes,
-                    True,
+                return outcome(
+                    retryable=True,
+                    permanent_failures=failures + len(rows) - len(handled),
                 )
 
             pending = [row for row in rows if row["id"] not in handled]
@@ -4251,6 +4682,8 @@ class RestoreRun:
                 client.get("address"): client for client in clients if client.get("address")
             }
             for row_id, address in found.items():
+                if clock.monotonic() >= deadline:
+                    break
                 matches[row_id] = address
                 used_addresses.add(address)
                 row = row_by_id[row_id]
@@ -4270,7 +4703,7 @@ class RestoreRun:
                     compositor=compositor,
                 )
                 if monitor_result.status is MutationStatus.UNAVAILABLE:
-                    return restored, failures, launched_processes, True
+                    return outcome(retryable=True)
                 monitor_ok = monitor_result.succeeded
                 if not monitor_ok:
                     failed_monitor_workspaces.add(workspace_id)
@@ -4292,7 +4725,7 @@ class RestoreRun:
                     else MutationResult(MutationStatus.REJECTED)
                 )
                 if placement.status is MutationStatus.UNAVAILABLE:
-                    return restored, failures, launched_processes, True
+                    return outcome(retryable=True)
                 if placement.succeeded:
                     restored += 1
                     placed.add(row_id)
@@ -4312,47 +4745,81 @@ class RestoreRun:
                     clients,
                     layouts or {},
                     compositor=compositor,
+                    clock=clock,
+                    deadline=deadline,
                     write_log=write_log,
                 )
                 if tiled_result is None:
                     write_log(
                         "restore: Hyprland IPC failed while replaying tiled layouts"
                     )
-                    return restored, failures, launched_processes, True
-                if not tiled_result:
+                    return outcome(retryable=True)
+                if not tiled_result and tiled_result is TiledStatus.REJECTED:
                     failures += 1
 
-            now = clock.monotonic()
+            if clock.monotonic() >= deadline:
+                break
             for state in states:
+                now = clock.monotonic()
+                if now >= deadline:
+                    break
                 missing = [row for row in state["rows"] if row["id"] not in handled]
+                serial_blocked = state["serial_key"] is not None and any(
+                    previous is not state
+                    and previous["serial_key"] == state["serial_key"]
+                    and previous["launch_succeeded"]
+                    and any(row["id"] not in handled for row in previous["rows"])
+                    for previous in states
+                )
                 if (
                     missing
+                    and not serial_blocked
                     and state["attempts"] < state["max_attempts"]
                     and now >= state["next_retry"]
                 ):
-                    _, _, action = launch_request(state["launch_row"])
+                    command, _, action = launch_request(
+                        state["launch_row"],
+                        terminal_cwd=(
+                            state["launch_row"]["id"] in self._safe_terminal_cwds
+                        ),
+                    )
+                    if not terminal_executable_available(
+                        state["launch_row"], command
+                    ):
+                        failures += len(missing)
+                        handled.update(row["id"] for row in missing)
+                        state["attempts"] = state["max_attempts"]
+                        write_log(
+                            "restore: terminal emulator unavailable for "
+                            f"{state['launch_row']['class']}"
+                        )
+                        continue
                     launch = compositor.apply(action)
                     if launch.succeeded:
                         launched_processes += 1
                         state["attempts"] += 1
+                        state["launch_succeeded"] = True
+                        attempted_windows.update(row["id"] for row in state["rows"])
                         state["next_retry"] = now + RESTORE_RETRY_DELAY
                     elif launch.status is MutationStatus.UNAVAILABLE:
-                        return (
-                            restored,
-                            failures + len(rows) - len(handled),
-                            launched_processes,
-                            True,
+                        return outcome(
+                            retryable=True,
+                            permanent_failures=failures + len(rows) - len(handled),
                         )
                     else:
                         state["attempts"] = state["max_attempts"]
+                        failures += len(missing)
+                        handled.update(row["id"] for row in missing)
 
             if len(handled) < len(rows):
                 clock.sleep(RESTORE_POLL_INTERVAL)
 
+        missing_windows = len(rows) - len(handled)
         for row in rows:
             if row["id"] not in handled:
-                failures += 1
                 write_log(f"restore: no window appeared for {row['class']}")
+        if missing_windows and clock.monotonic() >= deadline:
+            return outcome(missing=missing_windows)
         focus_context = load_focus_context(compositor=compositor)
         retryable_failure = focus_context is None
         if focus_context is None:
@@ -4364,7 +4831,7 @@ class RestoreRun:
             clients = observed(compositor, ObservationKind.WINDOWS)
             if clients is None:
                 write_log("restore: Hyprland IPC failed while correcting tiled slots")
-                return restored, failures, launched_processes, True
+                return outcome(retryable=True)
             tiled_matches = {
                 row_id: address
                 for row_id, address in matches.items()
@@ -4377,25 +4844,31 @@ class RestoreRun:
                 layouts or {},
                 focus_context,
                 compositor=compositor,
+                clock=clock,
+                deadline=deadline,
                 write_log=write_log,
             )
             if tiled_result is None:
                 write_log("restore: Hyprland IPC failed while replaying tiled layouts")
-                return restored, failures, launched_processes, True
+                return outcome(retryable=True)
             if not tiled_result:
-                failures += 1
+                if tiled_result is TiledStatus.DEGRADED:
+                    degraded_failures += 1
+                else:
+                    failures += 1
         floating_result = verify_floating_placements(
             rows,
             {row_id: matches[row_id] for row_id in placed},
             compositor=compositor,
             clock=clock,
+            deadline=deadline,
             write_log=write_log,
         )
         if floating_result is None:
             write_log("restore: Hyprland IPC failed while verifying floating geometry")
-            return restored, failures, launched_processes, True
+            return outcome(retryable=True)
         if not floating_result:
-            failures += 1
+            degraded_failures += 1
         group_result = restore_window_groups(
             rows,
             matches,
@@ -4405,7 +4878,7 @@ class RestoreRun:
         )
         if group_result is None:
             write_log("restore: Hyprland IPC failed while restoring window groups")
-            return restored, failures, launched_processes, True
+            return outcome(retryable=True)
         if not group_result:
             failures += 1
         if focus_context is not None:
@@ -4414,14 +4887,14 @@ class RestoreRun:
             )
             if focus_result is None:
                 write_log("restore: Hyprland IPC failed while restoring focus")
-                return restored, failures, launched_processes, True
+                return outcome(retryable=True)
             if not focus_result:
                 write_log("restore: failed to restore the previously focused workspace")
                 failures += 1
-        return restored, failures, launched_processes, retryable_failure
+        return outcome(retryable=retryable_failure, missing=missing_windows)
 
 
-def cmd_restore(dry_run=False, name=None):
+def cmd_restore(dry_run=False, name=None, timeout=None, retry_incomplete=False):
     if name is not None:
         session_name(name)
     cfg = load_config()
@@ -4451,10 +4924,18 @@ def cmd_restore(dry_run=False, name=None):
         if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
             print("restore failed: Hyprland IPC is unavailable", file=sys.stderr)
             return 75
+        if retry_incomplete:
+            retry_delay = incomplete_restore_retry_delay(sid)
+            if retry_delay:
+                log(
+                    "restore: observing grace period before retrying incomplete windows"
+                )
+                time.sleep(retry_delay)
+        timeout_seconds = cfg["restore_timeout_seconds"] if timeout is None else timeout
         prepared = RestoreRun.prepare(
             snapshot,
             RestoreSettings(
-                timeout_seconds=cfg["restore_timeout_seconds"],
+                timeout_seconds=timeout_seconds,
                 monitor_fallback=cfg["monitor_fallback"],
             ),
         )
@@ -4489,7 +4970,19 @@ def cmd_restore(dry_run=False, name=None):
             )
             return 0
 
-        if not mark_restore_completed(sid, complete=False):
+        planned_attempts = prepared.preview().window_ids if retry_incomplete else ()
+        if not mark_restore_completed(
+            sid,
+            complete=False,
+            **(
+                {
+                    "attempted_windows": planned_attempts,
+                    "attempted_at": time.time() + timeout_seconds,
+                }
+                if retry_incomplete
+                else {}
+            ),
+        ):
             print("restore deferred: could not persist restore state", file=sys.stderr)
             return 75
 
@@ -4501,13 +4994,37 @@ def cmd_restore(dry_run=False, name=None):
             + (f" (named session {name!r})" if name is not None else "")
         )
         if outcome.retryable_failure:
+            if retry_incomplete and outcome.attempted_windows:
+                mark_restore_completed(
+                    sid,
+                    complete=False,
+                    attempted_windows=outcome.attempted_windows,
+                )
             return 75
-        if outcome.permanent_failures:
-            # Some windows failed permanently, but the restore attempt itself
-            # is over: close the gate so periodic autosave isn't blocked for
-            # the rest of the Hyprland session.
-            mark_restore_completed(sid)
+        if outcome.kind is RestoreOutcomeKind.INCOMPLETE:
+            print(
+                f"restore incomplete: restored {outcome.restored_windows}/{len(rows)}; "
+                f"{outcome.missing_windows} window(s) did not appear",
+                file=sys.stderr,
+            )
+            if retry_incomplete:
+                if not mark_restore_completed(
+                    sid,
+                    complete=False,
+                    attempted_windows=outcome.attempted_windows,
+                ):
+                    return 75
+                return 75
             return 1
+        if outcome.kind is RestoreOutcomeKind.FAILED:
+            if not mark_restore_completed(sid):
+                return 75
+            return 1
+        if outcome.kind is RestoreOutcomeKind.DEGRADED:
+            print(
+                "restore degraded: some window geometry did not settle",
+                file=sys.stderr,
+            )
         if not mark_restore_completed(sid):
             return 75
         write_current_session_name(name)
@@ -4637,8 +5154,12 @@ def cmd_acceptance(expect_power_save=False, expect_restore_failure=False):
         marker = {}
     marker_complete = marker.get("complete") is True and marker.get("instance") == instance
     checks.append(
-        acceptance_result(marker_complete != expect_restore_failure,
-                          "restore marker " + ("is incomplete as expected" if expect_restore_failure else "matches this compositor"))
+        acceptance_result(
+            marker_complete,
+            "restore marker permits autosave after the completed attempt"
+            if expect_restore_failure
+            else "restore marker matches this compositor",
+        )
     )
     session, rows = acceptance_session(marker)
     session_complete = bool(session and session[1] == "complete")
@@ -4752,6 +5273,8 @@ def main():
     p_restore = sub.add_parser("restore", help="restore latest snapshot")
     p_restore.add_argument("--dry-run", action="store_true")
     p_restore.add_argument("--name", type=argparse_session_name)
+    p_restore.add_argument("--timeout", type=argparse_restore_timeout)
+    p_restore.add_argument("--retry-incomplete", action="store_true")
 
     p_auto = sub.add_parser("autosave", help="periodically save")
     p_auto.add_argument("--interval", type=int, default=None)
@@ -4781,7 +5304,12 @@ def main():
                 args.label, teardown=args.teardown, wait=args.wait, name=args.name
             )
         if args.command == "restore":
-            return cmd_restore(dry_run=args.dry_run, name=args.name)
+            return cmd_restore(
+                dry_run=args.dry_run,
+                name=args.name,
+                timeout=args.timeout,
+                retry_incomplete=args.retry_incomplete,
+            )
         if args.command == "autosave":
             return cmd_autosave(args.interval)
         if args.command == "status":

@@ -4,6 +4,24 @@ All notable changes to `omarchy-sesh` are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Restore now recreates each saved Alacritty, Foot, Ghostty, Kitty, and WezTerm
+  OS window with a canonical one-window command instead of replaying terminal
+  daemon/server commands that may create no window.
+- Tiled correction waits for Hyprland to settle and retries once, improving
+  Chromium split geometry during startup restore.
+- Panel restores use one 10-second budget and report incomplete restoration as a
+  warning. Startup uses a 60-second budget plus a persisted 30-second
+  observation grace before retrying incomplete launches.
+
+### Changed
+
+- Schema version 7 records terminal launch profiles. Existing databases migrate
+  in place and legacy terminal rows are inferred conservatively.
+- Restore outcomes now distinguish complete, degraded, incomplete, permanent,
+  and retryable results so incomplete desktops cannot unlock autosave.
+
 ## v0.2.8 - 2026-09-02
 
 ### Added

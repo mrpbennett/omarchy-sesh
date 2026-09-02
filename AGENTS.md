@@ -54,7 +54,9 @@ Read `README.md` for user-facing behavior and
 `save` reads `hyprctl -j clients` and `hyprctl -j monitors`, then reads each
 mapped client's command line and cwd from `/proc/<pid>`. It writes a session and
 ordered window rows to SQLite. Saved PIDs group windows belonging to one
-process; they are not identities that survive reboot.
+process; they are not identities that survive reboot. Recognized terminal
+windows persist a launch profile and do not use shared server PIDs as launch or
+cwd identity.
 
 `restore` selects the newest complete snapshot, matches already-open windows
 one-to-one, launches all missing process groups through Hyprland's Lua dispatch
@@ -62,6 +64,8 @@ API, and polls all outstanding windows within one shared deadline. Each matched
 window is placed immediately. Strictly recognized Chromium app-mode windows are
 launched individually through `omarchy-launch-webapp`. On Hyprland 0.56+, safe
 complete window groups are reconstructed after placement and tiled correction.
+Supported terminal windows launch one OS window per saved row through canonical
+Alacritty, Foot, Ghostty, Kitty, or WezTerm commands.
 
 `autosave` waits before its first capture and remains gated until restore has
 completed for the current `HYPRLAND_INSTANCE_SIGNATURE`. Omarchy power-menu
@@ -104,7 +108,8 @@ assume paths under `$HOME` when an XDG override is available. Only `save`,
   translation.
 - Window matching is one-to-one. Never deduplicate only by class, and never
   claim an unrelated pre-existing client while discovering launched windows.
-- Launch grouping follows saved PID, except strict Chromium web-app rows. Launch
+- Launch grouping follows saved PID, except strict Chromium web-app and supported
+  terminal rows. Launch
   every initial missing group before polling so a slow app cannot serialize the
   entire restore.
 - Encode Hyprland dispatcher values as Lua strings with `lua_quote`; shell
@@ -118,6 +123,8 @@ assume paths under `$HOME` when an XDG override is available. Only `save`,
   creates duplicate-restore races.
 - The restore-complete marker is scoped to the compositor instance. Autosave
   must not overwrite the reboot snapshot before startup restore succeeds.
+  Incomplete startup attempts persist bounded row-attempt metadata and observe a
+  grace period before relaunch; degraded or permanent outcomes may open the gate.
 - The current-session marker is best-effort secondary panel metadata. Named and
   ordinary saves/restores and deletion update it where applicable, but write
   failures are logged and do not fail the primary operation. Installation,

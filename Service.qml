@@ -115,7 +115,9 @@ Item {
     status = action === "restore" ? "Restoring session..." : "Saving session..."
     error = ""
     actionProcess.command = action === "restore"
-      ? (name === undefined ? [binaryPath, "restore"] : [binaryPath, "restore", "--name", name])
+      ? (name === undefined
+          ? [binaryPath, "restore", "--timeout", "10"]
+          : [binaryPath, "restore", "--name", name, "--timeout", "10"])
       : [binaryPath, "save", "--label", "manual"]
     actionProcess.running = true
     return true
@@ -257,8 +259,14 @@ Item {
         root.status = actionOutput.text.trim() || "Session action completed"
         root.error = ""
       } else {
-        root.status = ""
-        root.error = actionError.text.trim() || actionOutput.text.trim() || "Session action failed"
+        var message = actionError.text.trim() || actionOutput.text.trim() || "Session action failed"
+        if (message.startsWith("restore incomplete:")) {
+          root.status = message
+          root.error = ""
+        } else {
+          root.status = ""
+          root.error = message
+        }
       }
       root.refresh(true)
     }

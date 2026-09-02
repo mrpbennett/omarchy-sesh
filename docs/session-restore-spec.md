@@ -152,6 +152,7 @@ CREATE TABLE windows (
     pid           INTEGER,                  -- groups windows from one process
     group_id      INTEGER,                  -- snapshot-local Hyprland group
     group_ord     INTEGER,                  -- zero-based saved member order
+    terminal_profile TEXT,                  -- recognized terminal launch policy
     FOREIGN KEY (session) REFERENCES sessions(id)
 );
 
@@ -186,7 +187,7 @@ CREATE TABLE workspace_layouts (
     FOREIGN KEY (session) REFERENCES sessions(id)
 );
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 ```
 
 Rules:
@@ -209,6 +210,9 @@ Rules:
   `SnapshotWindow` values. Restore algorithms identify a window by that
   snapshot-local order; SQLite row and foreign-key identities do not cross the
   module interface.
+- Recognized Alacritty, Foot, Ghostty, Kitty, and WezTerm windows persist a
+  terminal profile. Shared terminal-server PIDs do not make their process cwd
+  attributable to each window, so those rows omit cwd.
 - `clients[].grouped` addresses are translated to nullable snapshot-local
   `group_id` and `group_ord` values only when every ordered member was captured
   and every member reports the same group. Incomplete or malformed groups are
@@ -226,7 +230,8 @@ Rules:
 2. For each, read `/proc/<pid>/cmdline` and `/proc/<pid>/cwd` (resolve cwd
    symlink). Skip windows whose cmdline is empty, is `hyprctl`, or is in the
    exclude list.
-3. Group windows by saved PID. Determine numeric `workspace_id`; resolve the
+3. Classify supported terminal emulators, then group non-terminal windows by
+   saved PID. Determine numeric `workspace_id`; resolve the
    monitor connector name and description via `hyprctl -j monitors` (map
    `monitor` id to its monitor record). Retain `at` and `size` for tiled windows
    as slot identity metadata and inputs to guarded post-launch sizing.
@@ -263,7 +268,8 @@ the service retries after two seconds.
 2. Build saved PID groups in window order and dispatch every missing group
    immediately, without waiting for an earlier application to start. Then poll
    all outstanding rows together every 50 ms within one shared deadline
-   (`restore_timeout_seconds`, default 20), placing each window as soon as it is
+   (`restore_timeout_seconds`, default 20, or `--timeout`), placing each window
+   as soon as it is
    matched. If one launch does
    not recreate every saved window, retry that group independently after a
    short grace period, up to the number of windows initially missing from the
@@ -271,8 +277,12 @@ the service retries after two seconds.
    - Chromium app-mode windows reconstruct their URL from strict class metadata
      validated against either the initial title or saved `--app` argument and
      launch each through `omarchy-launch-webapp`, because the base Chromium
-     process does not reopen those windows after reboot. Chromium's `Default`
-     and `Profile_N` class suffixes are treated as the same web-app identity.
+      process does not reopen those windows after reboot. Chromium's `Default`
+      and `Profile_N` class suffixes are treated as the same web-app identity.
+   - Alacritty, Foot, Ghostty, Kitty, and WezTerm use profile-specific canonical
+     one-OS-window commands. Every saved terminal window is a launch group;
+     indistinguishable terminal rows launch serially for address correlation.
+     Legacy rows are inferred conservatively from executable and class.
    - Launch through `hl.dsp.exec_cmd` with the saved silent workspace and
      floating rules.
    - Discover windows by polling and matching class, initial class/title,
@@ -335,8 +345,9 @@ the service retries after two seconds.
       its exact saved ratio, restore the prior focus in the same Lua evaluation,
       and verify both resulting rectangles. Legacy or non-dwindle snapshots
       retain guarded absolute sizing. A compositor-accepted operation that does
-      not settle to the saved geometry fails restore instead of silently leaving
-      the default 50/50 split. Exact compatible-slot swaps remain available, and
+       not settle to the saved geometry is retried after a compositor settling
+       interval, then reported as degraded rather than silently leaving the
+       default 50/50 split. Exact compatible-slot swaps remain available, and
       a monitor-origin change alone does not prevent either path.
 3. Execute a prepared Restore run at most once. Rebuild or correct a tiled
    layout as soon as all of that workspace's saved
@@ -364,6 +375,12 @@ translate to exit 75 where systemd may retry. Current-session metadata failures
 are only logged. Rejected actions, corrupt or inaccessible permanent storage
 errors, and other permanent restore failures translate to exit 1, which prevents
 a restart loop.
+An incomplete run also exits 1 for an interactive caller and keeps the autosave
+marker closed. The startup unit uses a 60-second timeout and retry mode; it
+persists attempted Snapshot rows, waits out a 30-second observation-only grace,
+then observes before another launch-capable attempt. Degraded geometry exits 0
+with a warning and permits autosave, as does a completed permanent-failure
+attempt after its exit-1 result has prevented automatic relaunch.
 The adapters preserve this distinction as typed observation and mutation
 results rather than inferring it again in commands. Log
 details to `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/log/omarchy-sesh.log`,

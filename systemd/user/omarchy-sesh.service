@@ -6,7 +6,7 @@ PartOf=graphical-session.target
 [Service]
 Type=oneshot
 UMask=0077
-ExecStart=%h/.local/bin/omarchy-sesh restore
+ExecStart=%h/.local/bin/omarchy-sesh restore --timeout 60 --retry-incomplete
 ExecStop=-%h/.local/bin/omarchy-sesh save --label logout --teardown
 RemainAfterExit=yes
 Restart=on-failure

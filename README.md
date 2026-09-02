@@ -92,7 +92,7 @@ See [How it works](#how-it-works) for the full save/restore behavior and
 
 ```sh
 omarchy-sesh save [--label LABEL] [--name NAME]                         # snapshot current windows
-omarchy-sesh restore [--name NAME] [--dry-run]                          # restore latest or named snapshot
+omarchy-sesh restore [--name NAME] [--dry-run] [--timeout SECONDS]      # restore latest or named snapshot
 omarchy-sesh autosave [--interval 60]                                   # periodic save (crash cover)
 omarchy-sesh status                                                     # list saved sessions
 omarchy-sesh list [--json]                                              # list named sessions
@@ -156,7 +156,8 @@ floating/fullscreen/pinned state are captured alongside the launch command and
 written as one `sessions` row plus window and workspace-layout rows in the
 SQLite DB. Complete Hyprland group membership and member order are translated
 from live addresses to snapshot-local metadata. Windows sharing a saved PID are
-kept as one launch group. By default, the latest five complete and five
+kept as one launch group, except recognized terminal windows and Chromium web
+apps, which launch individually. By default, the latest five complete and five
 diagnostic snapshots are retained; retention is configurable.
 
 Complete command lines can contain credentials supplied as arguments. The
@@ -169,7 +170,7 @@ calling terminal for inspection.
 Snapshot history owns SQLite migration, atomic writes, selection, retention,
 and named-session deletion. It returns immutable Snapshots whose windows use
 their order within that Snapshot as identity, rather than a database row ID.
-The schema remains version 6; existing databases migrate in place.
+The schema is version 7; existing databases migrate in place.
 
 **Named save** (`omarchy-sesh save --name NAME`) captures the same state as a
 manual save and assigns it a unique name. Named sessions are independent from
@@ -211,6 +212,12 @@ direction, and split ratios recreate the saved geometry, which is then verified.
 Eligible two-window dwindle workspaces set their saved split ratio directly and
 also verify both resulting rectangles, so a 30/70 split is not silently accepted
 as Hyprland's default 50/50 split.
+Alacritty, Foot, Ghostty, Kitty, and WezTerm use canonical one-window launch
+commands instead of replaying saved daemon or server commands. Each saved
+terminal OS window launches independently; indistinguishable terminal windows
+serialize only long enough to correlate their new addresses. The saved emulator
+is preserved, while a shared server cwd is omitted because it cannot be
+attributed safely to one window.
 Each saved workspace returns to the same connected monitor; renamed or rewired
 outputs are identified by monitor description. Workspaces from disconnected
 displays use the configured fallback: the focused monitor then the lowest
@@ -220,6 +227,8 @@ Floating windows temporarily leave pinned/fullscreen state when necessary,
 resize before moving, and then return to their saved state. Restore verifies
 their final compositor geometry after a short settling interval and reapplies
 one mismatched placement pass.
+Tiled ratio correction also waits for Hyprland to settle and retries one
+accepted mismatch before reporting degraded geometry.
 `--dry-run` prints the launch plan without executing it.
 
 Restore prepares one immutable Restore run from the selected Snapshot and its
@@ -228,7 +237,11 @@ is single-use. Production Hyprland IPC is behind an adapter that exposes the
 same semantic observations, actions, and typed results used by deterministic
 tests. Transport and temporarily unavailable storage, capture, focus,
 placement, monitor, or replay operations exit 75 so systemd may retry. Rejected
-operations and other permanent failures exit 1 and do not restart-loop.
+operations and other permanent failures exit 1 and do not restart-loop. A
+complete restore exits 0; a degraded restore exits 0 with a warning; an
+incomplete restore exits 1 and keeps autosave gated. The panel supplies a
+10-second timeout. Startup supplies 60 seconds and retries incomplete runs only
+after a persisted 30-second observation grace period.
 
 On Hyprland 0.56 or newer, complete and uniquely matched window groups are
 re-formed in saved member order after placement. Partial or ambiguous groups,
@@ -239,7 +252,7 @@ continues to restore the windows without grouping them.
 
 **Autosave** (`omarchy-sesh autosave`) waits one interval before its first
 capture, then saves periodically (default 60s, configurable). It remains gated
-until restore succeeds, so a partial login cannot replace the reboot snapshot,
+while restore is incomplete, so a partial login cannot replace the reboot snapshot,
 and refreshes the active Hyprland instance before every capture. Explicitly
 selecting Active mode captures the current desktop first when no successful
 restore marker exists. A synchronous logout, reboot, or shutdown save closes
